@@ -68,7 +68,7 @@ Step 5  持久化
 
 ---
 
-## 搜索关键词（当前共 96 个）
+## 搜索关键词
 
 来源：CoinGecko CEX 榜单。同时作为 YouTube 搜索词和推广平台识别规则，新增平台只需在 `config.py` 的 `SEARCH_KEYWORDS` 中追加一行。
 
@@ -99,18 +99,6 @@ coindcx, tothemoon, koinpark, orbix, mercado bitcoin
 | --- | --- | --- | --- |
 | `SEARCH_MAX_RESULTS` | config.py | 50 | 每个关键词每次最多拉取视频数 |
 | 定时时间 | .github/workflows/crawl.yml | UTC 01:00 | cron: `0 1 * * *` |
-
----
-
-## YouTube API 配额说明
-
-YouTube Data API v3 每日上限 **10,000 units**：
-- `search.list`：每次调用消耗 **100 units**
-- `videos.list`：每次调用消耗 **1 unit**（每批最多 50 条）
-
-96 个关键词 × 100 units = 9,600 units（search 部分），加上 videos.list 约占满每日配额。如需提额，前往 Google Cloud Console → APIs & Services → YouTube Data API v3 → Quotas 申请。
-
-遇到 429 限流时，程序会停止继续搜索，但已拉取到的视频会正常完成提取、写入和推送。
 
 ---
 
