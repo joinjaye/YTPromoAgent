@@ -15,4 +15,4 @@ SEARCH_KEYWORDS = [
 ]
 
 # Max videos fetched per keyword per run 
-SEARCH_MAX_RESULTS = 100
+SEARCH_MAX_RESULTS = 50
