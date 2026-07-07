@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from googleapiclient.errors import HttpError
 
 from config import SEARCH_KEYWORDS
 from youtube_fetcher import fetch_videos_for_query
@@ -16,14 +17,24 @@ def run():
     seen_video_ids: set[str] = set()
     all_videos: list[dict] = []
 
+    quota_hit = False
     for query in SEARCH_KEYWORDS:
-        published_after = get_last_crawl_time(query)
-        videos = fetch_videos_for_query(query, published_after)
-        update_crawl_log(query)
-        for v in videos:
-            if v["video_id"] not in seen_video_ids:
-                seen_video_ids.add(v["video_id"])
-                all_videos.append(v)
+        if quota_hit:
+            break
+        try:
+            published_after = get_last_crawl_time(query)
+            videos = fetch_videos_for_query(query, published_after)
+            update_crawl_log(query)
+            for v in videos:
+                if v["video_id"] not in seen_video_ids:
+                    seen_video_ids.add(v["video_id"])
+                    all_videos.append(v)
+        except HttpError as e:
+            if e.resp.status == 429:
+                print(f"[限流] YouTube API 配额耗尽，停止搜索，已收集 {len(all_videos)} 条视频继续处理")
+                quota_hit = True
+            else:
+                raise
 
     print(f"\n[汇总] 共 {len(all_videos)} 条新视频（已跨关键词去重）")
 
