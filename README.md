@@ -1,146 +1,163 @@
-# promoLeads
+# YoutubePromoAgent
 
-自动从 YouTube 搜索竞品交易所关键词，提取视频 description 中的推广链接，写入飞书多维表格并推送群卡片通知。每 10 分钟自动执行一轮，通过 crawl_log 确保只拉取新发布的视频，不重复爬取。
+自动从 YouTube 搜索竞品交易所关键词，提取视频 description 中的推广（affiliate）链接，写入飞书多维表格并推送群卡片通知。
+
+通过 GitHub Actions 每天 UTC 01:00 自动运行，基于 crawl_log 做增量爬取，不重复处理已访问过的视频。
 
 ---
 
 ## 整体流程
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│  每 10 分钟触发一轮 run()                                │
-└────────────────────┬────────────────────────────────────┘
-                     │
-         ┌───────────▼───────────┐
-         │  Step 1: YouTube 搜索  │
-         │  逐关键词增量拉取视频   │
-         └───────────┬───────────┘
-                     │  published_after = crawl_log 中该关键词的上次爬取时间
-                     │  → YouTube API 只返回该时间之后发布的新视频
-                     │  → 爬完立即更新 crawl_log（记录本次时间戳）
-                     │  → 跨关键词 video_id 去重（同一视频只处理一次）
-                     │
-         ┌───────────▼───────────┐
-         │  Step 2: 提取推广链接  │
-         │  解析每条视频 description│
-         └───────────┬───────────┘
-                     │  从 description 提取所有外链
-                     │  → 过滤社交/工具类域名（YouTube / Twitter / Discord 等）
-                     │  → 匹配 SEARCH_KEYWORDS 中的平台域名
-                     │  → 一条视频可拆出多条记录（每个 promo link 独立一行）
-                     │
-         ┌───────────▼───────────┐
-         │  Step 3: 写入飞书表格  │
-         │  batch_create_records  │
-         └───────────┬───────────┘
-                     │  每条记录附带自增 ID（SQLite record_counter）
-                     │  写入主键列作为唯一标识
-                     │
-         ┌───────────▼───────────┐
-         │  Step 4: 群卡片推送    │
-         │  notify_new_records    │
-         └───────────────────────┘
-                     逐条展示本轮新增详情（Youtuber / 推广平台 / 链接 / 视频）
+每天 UTC 01:00 自动触发（GitHub Actions）
+        │
+        ▼
+Step 1  YouTube 搜索
+        逐关键词查询，published_after = 上次爬取时间（crawl_log）
+        → 只返回该时间之后发布的新视频
+        → 爬完立即更新 crawl_log
+        → 跨关键词 video_id 去重（同一视频只处理一次）
+        → 遇到 429 限流时停止搜索，已收集数据继续处理
+        │
+        ▼
+Step 2  提取推广链接
+        解析每条视频的 description
+        → 识别 YouTube redirect 跳转链接并还原真实 URL
+        → 过滤社交/工具类域名（YouTube / Twitter / Discord 等）
+        → 匹配平台域名（规则来自 SEARCH_KEYWORDS）
+        → 一条视频可拆出多条记录（每个平台链接独立一行）
+        │
+        ▼
+Step 3  写入飞书多维表格
+        → 每条记录分配自增 ID（SQLite record_counter）
+        → batch_create_records 批量写入
+        │
+        ▼
+Step 4  群卡片推送
+        → 本轮新增记录逐条展示
+        → 无新记录时静默结束
+        │
+        ▼
+Step 5  持久化
+        → leads.db commit 回 GitHub 仓库
+        → 下次运行时 crawl_log 时间戳不丢失
 ```
 
 ---
 
-## 去重 & 防重爬机制
+## 飞书多维表格字段
 
-| 层级 | 机制 | 作用 |
-| --- | --- | --- |
-| 跨轮次 | `crawl_log` + YouTube `publishedAfter` 参数 | 每轮只拉取上次爬取时间之后发布的新视频，彻底避免跨轮重复 |
-| 同轮内 | `seen_video_ids` set | 同一视频被多个关键词命中时只处理一次，避免同一视频的 promo 链接重复提取 |
-| 同视频多平台 | 不去重 | 一条视频 description 中有多个平台链接时，每个链接独立成一条记录（正确行为） |
-| 飞书记录 | 不去重 | 每条记录单独写入，无 upsert；历史数据保持不变 |
-
----
-
-## 推广链接提取逻辑
-
-`link_extractor.extract_promo_links(description)` 的执行步骤：
-
-1. **YouTube redirect 解析**：description 中常见 `youtube.com/redirect?q=<实际URL>` 形式的跳转链接，先解析出真实目标 URL
-2. **直链扫描**：正则匹配所有 `https://` 开头的 URL
-3. **跳过名单过滤**：排除 YouTube、Twitter、Telegram、Instagram、Discord、TikTok、Facebook、Reddit、App Store 等社交/工具域名
-4. **平台匹配**：将 URL 域名与 `SEARCH_KEYWORDS` 派生的平台规则逐一比对
-   - 标准品牌：检查域名边界（`bybit.com`、`accounts.binance.com`、`sub.bybit.com` 等均可命中）
-   - 域名型关键词（`crypto.com`、`xt.com`、`coins.ph` 等）：精确匹配
-   - 复合名称（`mercado bitcoin` → `mercadobitcoin.com.br`）：拼接形式匹配
-5. **结果**：返回 `[{promo_link, promo_platform}, ...]`，一条 description 可返回多项
-
----
-
-## 飞书多维表格
-
-### 字段结构
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| 主键列 | 文本 | 自增整数 ID，由本地 SQLite `record_counter` 分配，写入时填入 |
-| Youtuber | 文本 | YouTube 频道名（`channelTitle`） |
-| 推广平台 | 文本 | 识别到的交易所名称 |
-| 推广链接 | 文本 | description 中提取的原始 affiliate 链接 |
-| Video 链接 | 文本 | YouTube 视频地址 |
-
-### 群通知卡片格式
-
-每轮有新记录时推送一张蓝色 interactive 卡片，标题显示本轮新增数量，正文逐条列出每条记录的 Youtuber / 推广平台 / 推广链接 / 视频链接，条目之间用分隔线区隔。
-
----
-
-## 本地 SQLite（data/leads.db）
-
-| 表 | 用途 |
+| 字段 | 说明 |
 | --- | --- |
-| `crawl_log` | 记录每个搜索关键词的上次成功爬取时间（RFC3339），供下次搜索设置 `publishedAfter` |
-| `record_counter` | 单行计数器，`allocate_record_ids(n)` 原子性地分配 n 个连续整数 ID |
+| 主键列 | 自增整数 ID，从 1 开始，每条记录唯一 |
+| Youtuber | YouTube 频道名 |
+| 推广平台 | 识别到的交易所名称 |
+| 推广链接 | description 中提取的原始 affiliate 链接 |
+| Video 链接 | YouTube 视频地址 |
 
 ---
 
-## 关键词 & 平台匹配（关键词来源：Coingecko top100 CEX）
+## 去重 & 防重爬说明
 
-`config.py` 的 `SEARCH_KEYWORDS` 同时承担两个职责：
+| 层级 | 机制 | 说明 |
+| --- | --- | --- |
+| 跨轮次 | crawl_log + YouTube publishedAfter | 每轮只拉上次时间之后的新视频，不重复爬取 |
+| 同轮跨关键词 | seen_video_ids set | 同一视频被多个关键词命中时只处理一次 |
+| 同视频多平台 | 不去重 | 一条视频推广了多个平台时，每个链接独立成一条记录 |
+| 飞书写入 | 不去重 | 每条记录直接 create，不做 upsert |
 
-1. **YouTube 搜索词**：逐一查询，每次最多拉取 `SEARCH_MAX_RESULTS`条
-2. **平台识别规则**：启动时由 `link_extractor._build_platforms()` 解析成 `(brand, brand_concat, display_name)` 三元组列表，用于 URL 域名匹配
+---
 
-新增平台只需在 `SEARCH_KEYWORDS` 中追加关键词，两个职责同步生效，无需改其他文件。
+## 搜索关键词（当前共 96 个）
+
+来源：CoinGecko CEX 榜单。同时作为 YouTube 搜索词和推广平台识别规则，新增平台只需在 `config.py` 的 `SEARCH_KEYWORDS` 中追加一行。
+
+```text
+coinbase exchange, binance, kraken, okx, bitget, bybit, mexc, gemini,
+bingx, bitvavo, crypto.com, hashkey exchange, gate, bitso, bitunix,
+lbank, kucoin, ourbit, coinstore, bitstamp by robinhood, coinw, bullish,
+binance us, toobit, bitkub, bitkan, whitebit, bitcointry, bit2me, luno,
+digifinex, upbit, weex, hashkey global, btse, bitbank, backpack exchange,
+cointr, bitmart, byte exchange, niza.io, nonkyc.io, zoomex, bitazza,
+deribit spot, pionex, bitfinex, valr, bitmex, max maicoin, htx, bitrue,
+bybit eu, bittime, gmo coin japan, coins.ph, gate us, okj, bithumb,
+hibt, itbit, bitflyer, bydfi, biconomy.com, p2b, xt.com, coinone, bitlo,
+emirex, phemex, grovex, cex.io, levex, korbit, azbit, coinex,
+independent reserve, btcturk | kripto, bittrade, websea, ascendex (bitmax),
+bitopro, pointpay, xbo.com, tapbit, difx, orangex, kcex, blofin, tokpie,
+dex-trade, nami exchange, tokocrypto, blockchain.com, figure markets,
+coindcx, tothemoon, koinpark, orbix, mercado bitcoin
+```
+
+每个关键词每次最多拉取 `SEARCH_MAX_RESULTS`（当前 50）条视频。
+
+---
+
+## 关键参数
+
+| 参数 | 位置 | 当前值 | 说明 |
+| --- | --- | --- | --- |
+| `SEARCH_MAX_RESULTS` | config.py | 50 | 每个关键词每次最多拉取视频数 |
+| 定时时间 | .github/workflows/crawl.yml | UTC 01:00 | cron: `0 1 * * *` |
+
+---
+
+## YouTube API 配额说明
+
+YouTube Data API v3 每日上限 **10,000 units**：
+- `search.list`：每次调用消耗 **100 units**
+- `videos.list`：每次调用消耗 **1 unit**（每批最多 50 条）
+
+96 个关键词 × 100 units = 9,600 units（search 部分），加上 videos.list 约占满每日配额。如需提额，前往 Google Cloud Console → APIs & Services → YouTube Data API v3 → Quotas 申请。
+
+遇到 429 限流时，程序会停止继续搜索，但已拉取到的视频会正常完成提取、写入和推送。
+
+---
+
+## 本地运行
+
+```bash
+cp .env.example .env   # 填入凭证
+pip install -r requirements.txt
+python main.py         # 运行一次后退出
+```
+
+---
+
+## 部署（GitHub Actions）
+
+### 环境变量配置
+
+在仓库 **Settings → Secrets and variables → Actions** 添加一个 Secret：
+
+| Secret 名称 | 内容 |
+| --- | --- |
+| `ENV_FILE` | 将本地 `.env` 文件全部内容粘贴进去 |
+
+### 自动运行
+
+推送到 `main` 分支后，每天 UTC 01:00 自动执行。
+
+也可在 **Actions → PromoLeads Crawl → Run workflow** 手动触发。
+
+每次运行结束后，`data/leads.db` 会自动 commit 回仓库（commit message 含 `[skip ci]`，不会触发新的 Actions）。
 
 ---
 
 ## 项目结构
 
 ```text
-promoLeads/
-├── main.py            # 主入口：run() 函数 + 10 分钟 while 循环
-├── youtube_fetcher.py # YouTube Data API v3：search.list + videos.list
-├── link_extractor.py  # description 解析：URL 提取、平台匹配
-├── feishu_client.py   # 飞书多维表格写入 + 群卡片推送
-├── db.py              # SQLite：crawl_log + record_counter
-├── config.py          # 环境变量读取 + SEARCH_KEYWORDS 配置
-├── .env               # 实际密钥（不入库）
-├── .env.example       # 密钥模板
+YoutubePromoAgent/
+├── main.py                      # 主入口，顺序执行四步流程
+├── youtube_fetcher.py           # YouTube Data API：search + videos.list
+├── link_extractor.py            # description 解析，平台域名匹配
+├── feishu_client.py             # 飞书多维表格写入 + 群卡片推送
+├── db.py                        # SQLite：crawl_log + record_counter
+├── config.py                    # 环境变量 + SEARCH_KEYWORDS + 参数
+├── .env.example                 # 环境变量模板
+├── .github/
+│   └── workflows/
+│       └── crawl.yml            # GitHub Actions 定时任务
 └── data/
-    └── leads.db       # 运行时自动创建
+    └── leads.db                 # 运行时自动创建，随仓库持久化
 ```
-
----
-
-## 环境配置
-
-```bash
-cp .env.example .env   # 填入各项凭证
-pip install -r requirements.txt
-python main.py
-```
-
-| 变量 | 说明 |
-| --- | --- |
-| `YOUTUBE_API_KEY` | Google Cloud Console → YouTube Data API v3 |
-| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书开放平台企业自建应用，需开通 `bitable:app` 权限 |
-| `FEISHU_BITABLE_APP_TOKEN` | 多维表格 URL 中 `/base/` 后的字符串 |
-| `FEISHU_BITABLE_TABLE_ID` | 多维表格 URL 中 `table=` 后的字符串 |
-| `FEISHU_WEBHOOK_URL` | 飞书群机器人 Webhook 地址 |
-
-首次运行自动初始化 SQLite 和飞书表字段，之后每 10 分钟循环执行。按 `Ctrl+C` 停止。
