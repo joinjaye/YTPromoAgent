@@ -12,14 +12,12 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
 def init_db():
     with _connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS crawl_log (
-                search_query    TEXT PRIMARY KEY,
-                last_crawled_at TEXT NOT NULL
-            )
-        """)
         # Auto-increment counter for Feishu primary field IDs
         conn.execute("""
             CREATE TABLE IF NOT EXISTS record_counter (
@@ -28,32 +26,38 @@ def init_db():
             )
         """)
         conn.execute("INSERT OR IGNORE INTO record_counter VALUES (1, 0)")
+
+        # Local copy of extracted leads (source of truth for the dashboard).
+        # UNIQUE guards against re-processing the same video/platform/link pair.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                youtuber          TEXT    NOT NULL,
+                promo_platform    TEXT    NOT NULL DEFAULT '',
+                promo_link        TEXT    NOT NULL DEFAULT '',
+                video_url         TEXT    NOT NULL DEFAULT '',
+                feishu_record_id  TEXT    DEFAULT '',
+                published_at      TEXT    DEFAULT '',
+                created_at        INTEGER,
+                UNIQUE(video_url, promo_platform, promo_link)
+            )
+        """)
+        _migrate_leads(conn)
+
+        # crawl_log tracked per-query incremental crawl timestamps; the crawler
+        # now uses a fixed "previous calendar day" window instead, so it's gone.
+        conn.execute("DROP TABLE IF EXISTS crawl_log")
+
         conn.commit()
     print("[DB] 初始化完成")
 
 
-def get_last_crawl_time(search_query: str) -> str | None:
-    """Return the last crawled timestamp for this query (RFC3339), or None if never crawled."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT last_crawled_at FROM crawl_log WHERE search_query = ?",
-            (search_query,),
-        ).fetchone()
-        return row["last_crawled_at"] if row else None
-
-
-def update_crawl_log(search_query: str):
-    now_rfc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with _connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO crawl_log (search_query, last_crawled_at)
-            VALUES (?, ?)
-            ON CONFLICT(search_query) DO UPDATE SET last_crawled_at = excluded.last_crawled_at
-            """,
-            (search_query, now_rfc),
-        )
-        conn.commit()
+def _migrate_leads(conn: sqlite3.Connection):
+    """Add new columns to an existing leads table (safe to run on fresh DBs too)."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)").fetchall()}
+    if "published_at" not in existing:
+        conn.execute("ALTER TABLE leads ADD COLUMN published_at TEXT DEFAULT ''")
+        print("[DB] leads 表迁移新增列: published_at")
 
 
 def allocate_record_ids(count: int) -> range:
@@ -70,3 +74,35 @@ def allocate_record_ids(count: int) -> range:
         end = conn.execute("SELECT value FROM record_counter").fetchone()[0]
         conn.commit()
     return range(end - count + 1, end + 1)
+
+
+def save_leads(records: list[dict], created_at: int | None = None):
+    """
+    Persist extracted leads locally (source of truth for the dashboard).
+    Each record: {youtuber, promo_platform, promo_link, video_url, published_at?}.
+    Duplicates (same video_url/promo_platform/promo_link) are silently skipped.
+    """
+    if not records:
+        return
+    ts = created_at if created_at is not None else _now_ms()
+    with _connect() as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO leads
+              (youtuber, promo_platform, promo_link, video_url, feishu_record_id, published_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    r["youtuber"],
+                    r.get("promo_platform", ""),
+                    r.get("promo_link", ""),
+                    r.get("video_url", ""),
+                    r.get("feishu_record_id", ""),
+                    r.get("published_at", ""),
+                    ts,
+                )
+                for r in records
+            ],
+        )
+        conn.commit()

@@ -1,11 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from googleapiclient.errors import HttpError
 
 from config import SEARCH_KEYWORDS
 from youtube_fetcher import fetch_videos_for_query
 from link_extractor import extract_promo_links
-from db import init_db, get_last_crawl_time, update_crawl_log
+from db import init_db, save_leads
 from feishu_client import setup_table, batch_create_records, notify_new_records
+
+CST = timezone(timedelta(hours=8))
 
 def run():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -13,7 +15,15 @@ def run():
     print(f"[{ts}] 开始执行")
     print("="*50)
 
-    # ── Step 1: 爬取 YouTube（增量，仅拉取上次爬取之后的新视频）──────────
+    # ── Step 1: 爬取 YouTube（固定窗口：只抓取"前一天"（北京时间）发布的视频）
+    # 例如今天(t+1)运行，抓取 t 这一天北京时间 00:00~24:00 发布的视频，
+    # 与上次实际爬取时间无关，避免窗口随运行间隔漂移。
+    today_start_cst     = datetime.now(CST).replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start_cst = today_start_cst - timedelta(days=1)
+    published_after  = yesterday_start_cst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    published_before = today_start_cst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[窗口] 抓取北京时间 {yesterday_start_cst.date()} 发布的视频（UTC: {published_after} ~ {published_before}）")
+
     seen_video_ids: set[str] = set()
     all_videos: list[dict] = []
 
@@ -22,9 +32,7 @@ def run():
         if quota_hit:
             break
         try:
-            published_after = get_last_crawl_time(query)
-            videos = fetch_videos_for_query(query, published_after)
-            update_crawl_log(query)
+            videos = fetch_videos_for_query(query, published_after, published_before)
             for v in videos:
                 if v["video_id"] not in seen_video_ids:
                     seen_video_ids.add(v["video_id"])
@@ -52,6 +60,7 @@ def run():
                 "promo_platform": promo["promo_platform"],
                 "promo_link":    promo["promo_link"],
                 "video_url":     video["video_url"],
+                "published_at":  video.get("published_at", ""),
             })
 
     if not records:
@@ -59,6 +68,9 @@ def run():
         return
 
     print(f"[推广] 提取到 {len(records)} 条推广记录")
+
+    # ── Step 2.5: 本地持久化（供看板读取，即使飞书写入失败也不丢数据）───
+    save_leads(records)
 
     # ── Step 3: 写入飞书多维表格 ─────────────────────────────────────────
     batch_create_records(records)

@@ -5,6 +5,7 @@ from config import (
     FEISHU_BITABLE_APP_TOKEN,
     FEISHU_BITABLE_TABLE_ID,
     FEISHU_WEBHOOK_URL,
+    DASHBOARD_URL,
 )
 
 FEISHU_API_BASE = "https://open.larksuite.com/open-apis"
@@ -164,15 +165,20 @@ def notify_new_records(records: list[dict]):
             },
         })
 
-    elements.append({
-        "tag": "action",
-        "actions": [{
+    actions = [{
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": "查看数据详情"},
+        "type": "primary",
+        "url": "https://skyrocket.sg.larksuite.com/base/ZALBbXqoaa9NMes3X9nlmogUgob?table=tblIDZup3Y6nAMon&view=vew4AfH9L7",
+    }]
+    if DASHBOARD_URL:
+        actions.append({
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "查看数据详情"},
-            "type": "primary",
-            "url": "https://skyrocket.sg.larksuite.com/base/ZALBbXqoaa9NMes3X9nlmogUgob?table=tblIDZup3Y6nAMon&view=vew4AfH9L7",
-        }],
-    })
+            "text": {"tag": "plain_text", "content": "查看可视化看板"},
+            "type": "default",
+            "url": DASHBOARD_URL,
+        })
+    elements.append({"tag": "action", "actions": actions})
 
     card = {
         "header": {

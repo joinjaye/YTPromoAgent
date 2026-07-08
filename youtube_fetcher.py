@@ -6,7 +6,7 @@ def _build_client():
     return build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
 
 
-def _search_video_ids(query: str, published_after: str | None, max_results: int) -> list[str]:
+def _search_video_ids(query: str, published_after: str | None, published_before: str | None, max_results: int) -> list[str]:
     youtube = _build_client()
     video_ids: list[str] = []
     page_token = None
@@ -22,6 +22,8 @@ def _search_video_ids(query: str, published_after: str | None, max_results: int)
         }
         if published_after:
             params["publishedAfter"] = published_after
+        if published_before:
+            params["publishedBefore"] = published_before
         if page_token:
             params["pageToken"] = page_token
 
@@ -62,11 +64,11 @@ def _get_video_details(video_ids: list[str]) -> list[dict]:
     return results
 
 
-def fetch_videos_for_query(query: str, published_after: str | None = None) -> list[dict]:
-    mode = f"增量 after {published_after}" if published_after else "冷启动"
+def fetch_videos_for_query(query: str, published_after: str | None = None, published_before: str | None = None) -> list[dict]:
+    mode = f"{published_after} ~ {published_before}" if published_after else "冷启动"
     print(f"  [YouTube] {query!r}  [{mode}]")
 
-    video_ids = _search_video_ids(query, published_after, SEARCH_MAX_RESULTS)
+    video_ids = _search_video_ids(query, published_after, published_before, SEARCH_MAX_RESULTS)
     if not video_ids:
         print(f"  [YouTube] 无新结果")
         return []
