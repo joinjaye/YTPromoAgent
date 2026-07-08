@@ -7,7 +7,7 @@ from config import (
     FEISHU_WEBHOOK_URL,
 )
 
-FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
+FEISHU_API_BASE = "https://open.larksuite.com/open-apis"
 
 _token_cache: str = ""
 _primary_field_name: str = ""  # cached from setup_table; used as auto-increment ID column
@@ -25,7 +25,7 @@ def _get_token() -> str:
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != 0:
-        raise RuntimeError(f"飞书 Token 获取失败: {data}")
+        raise RuntimeError(f"Lark Token 获取失败: {data}")
     _token_cache = data["tenant_access_token"]
     return _token_cache
 
@@ -72,7 +72,10 @@ def setup_table():
 
     resp = requests.get(fields_url, headers=headers, timeout=10)
     resp.raise_for_status()
-    items = resp.json().get("data", {}).get("items", [])
+    body = resp.json()
+    if body.get("code") != 0:
+        raise RuntimeError(f"[Lark] 获取表字段失败: {body}")
+    items = body.get("data", {}).get("items", [])
     _primary_field_name = items[0]["field_name"] if items else ""
     existing_names = {f["field_name"] for f in items}
 
@@ -80,18 +83,22 @@ def setup_table():
     for name, ftype in _FIELD_SCHEMA:
         if name in existing_names:
             continue
-        requests.post(
+        r = requests.post(
             fields_url,
             headers=headers,
             json={"field_name": name, "type": ftype},
             timeout=10,
-        ).raise_for_status()
+        )
+        r.raise_for_status()
+        r_body = r.json()
+        if r_body.get("code") != 0:
+            raise RuntimeError(f"[Lark] 新建字段 {name} 失败: {r_body}")
         created.append(name)
 
     if created:
-        print(f"[飞书] 新建字段: {', '.join(created)}")
+        print(f"[Lark] 新建字段: {', '.join(created)}")
     else:
-        print("[飞书] 表结构已就绪")
+        print("[Lark] 表结构已就绪")
 
 
 # ── 写入 ──────────────────────────────────────────────────────────────────────
@@ -128,16 +135,16 @@ def batch_create_records(records: list[dict]):
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
-            raise RuntimeError(f"批量新增失败: {data}")
+            raise RuntimeError(f"[Lark] 批量新增失败: {data}")
 
-    print(f"[飞书] 已写入 {len(records)} 条记录")
+    print(f"[Lark] 已写入 {len(records)} 条记录")
 
 
 # ── 群通知（卡片格式，逐条展示）─────────────────────────────────────────────
 
 def notify_new_records(records: list[dict]):
     if not FEISHU_WEBHOOK_URL:
-        print("[飞书] 未配置 FEISHU_WEBHOOK_URL，跳过群通知")
+        print("[Lark] 未配置 FEISHU_WEBHOOK_URL，跳过群通知")
         return
 
     elements: list[dict] = []
@@ -181,4 +188,4 @@ def notify_new_records(records: list[dict]):
         timeout=10,
     )
     resp.raise_for_status()
-    print(f"[飞书] 卡片通知已发送（{len(records)} 条）")
+    print(f"[Lark] 卡片通知已发送（{len(records)} 条）")
