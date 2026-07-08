@@ -26,6 +26,7 @@ def run():
 
     seen_video_ids: set[str] = set()
     all_videos: list[dict] = []
+    out_of_window = 0
 
     quota_hit = False
     for query in SEARCH_KEYWORDS:
@@ -34,15 +35,28 @@ def run():
         try:
             videos = fetch_videos_for_query(query, published_after, published_before)
             for v in videos:
-                if v["video_id"] not in seen_video_ids:
-                    seen_video_ids.add(v["video_id"])
-                    all_videos.append(v)
+                if v["video_id"] in seen_video_ids:
+                    continue
+                # YouTube's search publishedAfter/publishedBefore filters by an
+                # internal indexing timestamp, not strictly snippet.publishedAt —
+                # a small number of videos can slip through outside the window
+                # (sometimes by hours). Re-check locally since our whole crawl
+                # design depends on the window being exact.
+                pub = v.get("published_at", "")
+                if not (published_after <= pub < published_before):
+                    out_of_window += 1
+                    continue
+                seen_video_ids.add(v["video_id"])
+                all_videos.append(v)
         except HttpError as e:
             if e.resp.status == 429:
                 print(f"[限流] YouTube API 配额耗尽，停止搜索，已收集 {len(all_videos)} 条视频继续处理")
                 quota_hit = True
             else:
                 raise
+
+    if out_of_window:
+        print(f"[窗口] 过滤掉 {out_of_window} 条 YouTube 返回但发布时间不在窗口内的视频")
 
     print(f"\n[汇总] 共 {len(all_videos)} 条新视频（已跨关键词去重）")
 
