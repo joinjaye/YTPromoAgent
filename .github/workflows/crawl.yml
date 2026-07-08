@@ -1,9 +1,7 @@
 name: PromoLeads Crawl
 
 on:
-  schedule:
-    - cron: '0 1 * * *'   # 每天 UTC 01:00
-  workflow_dispatch:        # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   crawl:
