@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import requests
 from config import (
     FEISHU_APP_ID,
@@ -50,12 +52,24 @@ def _chunks(lst: list, n: int):
 # ── 表结构初始化 ──────────────────────────────────────────────────────────────
 
 _FIELD_SCHEMA = [
-    # (field_name, type)  type 1=Text
+    # (field_name, type)  type 1=Text, 5=DateTime
     ("Youtuber",  1),
     ("推广平台",  1),
     ("推广链接",  1),
     ("Video 链接", 1),
+    ("发布时间",  5),
 ]
+
+
+def _to_ms(published_at: str) -> int | None:
+    """YouTube publishedAt (RFC3339 UTC) -> ms epoch for a Feishu DateTime field."""
+    if not published_at:
+        return None
+    try:
+        dt = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
 
 
 def setup_table():
@@ -107,7 +121,7 @@ def setup_table():
 def batch_create_records(records: list[dict]):
     """
     Write promo records to Feishu bitable.
-    Each record: {youtuber, promo_platform, promo_link, video_url}
+    Each record: {youtuber, promo_platform, promo_link, video_url, published_at?}
     Primary field gets a sequential auto-increment ID sourced from local SQLite counter.
     """
     from db import allocate_record_ids
@@ -121,6 +135,9 @@ def batch_create_records(records: list[dict]):
             "推广链接":   r["promo_link"],
             "Video 链接": r["video_url"],
         }
+        pub_ms = _to_ms(r.get("published_at", ""))
+        if pub_ms is not None:
+            f["发布时间"] = pub_ms
         if _primary_field_name:
             f[_primary_field_name] = str(ids[i])
         fields_list.append(f)

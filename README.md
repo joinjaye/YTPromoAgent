@@ -66,8 +66,7 @@ Step 5  持久化
 | 推广平台 | 识别到的交易所名称 |
 | 推广链接 | description 中提取的原始 affiliate 链接 |
 | Video 链接 | YouTube 视频地址 |
-
-飞书只存这 4 个字段，视频发布时间等元数据只保存在本地 `leads` 表中，供看板使用。
+| 发布时间 | 视频的 YouTube 发布时间（DateTime 字段） |
 
 ---
 
