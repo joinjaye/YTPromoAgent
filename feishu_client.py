@@ -157,6 +157,16 @@ def notify_new_records(records: list[dict]):
             },
         })
 
+    elements.append({
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "查看数据详情"},
+            "type": "primary",
+            "url": "https://skyrocket.sg.larksuite.com/base/ZALBbXqoaa9NMes3X9nlmogUgob?table=tblIDZup3Y6nAMon&view=vew4AfH9L7",
+        }],
+    })
+
     card = {
         "header": {
             "title": {"tag": "plain_text", "content": f"🔍 发现 {len(records)} 条新推广记录"},
