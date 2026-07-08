@@ -70,15 +70,23 @@ def run():
     print(f"[推广] 提取到 {len(records)} 条推广记录")
 
     # ── Step 2.5: 本地持久化（供看板读取，即使飞书写入失败也不丢数据）───
-    save_leads(records)
+    # 只保留本地真正新增的记录，避免同一天内被重复触发时，对已经写过的
+    # 记录重复写入飞书 / 重复群推送。
+    new_records = save_leads(records)
+    skipped = len(records) - len(new_records)
+    print(f"[本地] 新增 {len(new_records)} 条（{skipped} 条已存在，跳过飞书写入与群推送）")
+
+    if not new_records:
+        print("[完成] 本次提取的推广记录均已存在，跳过飞书写入与群推送")
+        return
 
     # ── Step 3: 写入飞书多维表格 ─────────────────────────────────────────
-    batch_create_records(records)
+    batch_create_records(new_records)
 
     # ── Step 4: 群推送 ────────────────────────────────────────────────────
-    notify_new_records(records)
+    notify_new_records(new_records)
 
-    print(f"[完成] 本轮结束，共写入 {len(records)} 条记录")
+    print(f"[完成] 本轮结束，共写入 {len(new_records)} 条记录")
 
 
 if __name__ == "__main__":

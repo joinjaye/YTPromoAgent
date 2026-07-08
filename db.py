@@ -76,23 +76,29 @@ def allocate_record_ids(count: int) -> range:
     return range(end - count + 1, end + 1)
 
 
-def save_leads(records: list[dict], created_at: int | None = None):
+def save_leads(records: list[dict], created_at: int | None = None) -> list[dict]:
     """
     Persist extracted leads locally (source of truth for the dashboard).
     Each record: {youtuber, promo_platform, promo_link, video_url, published_at?}.
     Duplicates (same video_url/promo_platform/promo_link) are silently skipped.
+
+    Returns the subset of records that were newly inserted (not already present).
+    Callers should only forward this subset to Feishu/Lark, otherwise a repeat
+    run within the same crawl window (e.g. a duplicate trigger) will re-write
+    and re-notify for data that was already sent.
     """
     if not records:
-        return
+        return []
     ts = created_at if created_at is not None else _now_ms()
+    new_records = []
     with _connect() as conn:
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO leads
-              (youtuber, promo_platform, promo_link, video_url, feishu_record_id, published_at, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
+        for r in records:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO leads
+                  (youtuber, promo_platform, promo_link, video_url, feishu_record_id, published_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     r["youtuber"],
                     r.get("promo_platform", ""),
@@ -101,8 +107,9 @@ def save_leads(records: list[dict], created_at: int | None = None):
                     r.get("feishu_record_id", ""),
                     r.get("published_at", ""),
                     ts,
-                )
-                for r in records
-            ],
-        )
+                ),
+            )
+            if cur.rowcount > 0:
+                new_records.append(r)
         conn.commit()
+    return new_records

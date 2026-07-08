@@ -160,11 +160,28 @@ def batch_create_records(records: list[dict]):
 
 # ── 群通知（卡片格式，逐条展示）─────────────────────────────────────────────
 
+# Lark webhook silently drops overly large card payloads (HTTP 200, but the
+# message never appears in the group) — cap records per card and send
+# multiple messages instead of one giant one. Feishu's documented hard limit
+# is 30KB per card; measured against real (longest-URL) records, 90 records
+# ~= 27.4KB and 100 ~= 30.1KB (over the limit). 60 gives a comfortable margin
+# (~19KB even in the worst case) while still batching efficiently.
+MAX_RECORDS_PER_CARD = 60
+
+
 def notify_new_records(records: list[dict]):
     if not FEISHU_WEBHOOK_URL:
         print("[Lark] 未配置 FEISHU_WEBHOOK_URL，跳过群通知")
         return
+    if not records:
+        return
 
+    batches = list(_chunks(records, MAX_RECORDS_PER_CARD))
+    for i, batch in enumerate(batches, start=1):
+        _send_card(batch, i, len(batches))
+
+
+def _send_card(records: list[dict], batch_index: int, batch_total: int):
     elements: list[dict] = []
     for i, r in enumerate(records):
         if i > 0:
@@ -197,9 +214,13 @@ def notify_new_records(records: list[dict]):
         })
     elements.append({"tag": "action", "actions": actions})
 
+    title = f"🔍 发现 {len(records)} 条新推广记录"
+    if batch_total > 1:
+        title += f"（第 {batch_index}/{batch_total} 批）"
+
     card = {
         "header": {
-            "title": {"tag": "plain_text", "content": f"🔍 发现 {len(records)} 条新推广记录"},
+            "title": {"tag": "plain_text", "content": title},
             "template": "blue",
         },
         "elements": elements,
@@ -211,4 +232,12 @@ def notify_new_records(records: list[dict]):
         timeout=10,
     )
     resp.raise_for_status()
-    print(f"[Lark] 卡片通知已发送（{len(records)} 条）")
+    body = resp.json()
+    # Lark webhook responses use either {"code":...} (new) or {"StatusCode":...}
+    # (legacy custom bot) — a 200 status does NOT guarantee the message was
+    # actually delivered, so check the body explicitly instead of trusting
+    # raise_for_status() alone.
+    status = body.get("code", body.get("StatusCode", 0))
+    if status != 0:
+        raise RuntimeError(f"[Lark] 群通知发送失败（第 {batch_index}/{batch_total} 批）: {body}")
+    print(f"[Lark] 卡片通知已发送（第 {batch_index}/{batch_total} 批，{len(records)} 条）")
