@@ -23,7 +23,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # 不能用 github.event.workflow_run.head_sha —— 它是 crawl workflow
+          # *开始时* 的 commit，而 crawl 自己在运行过程中还会 push 一个新的
+          # "chore: update crawl log" commit（更新 data/leads.db）。用 head_sha
+          # 会导致每次部署都固定落后 crawl 自己那次提交，看板永远差一拍。
+          # main 分支在 workflow_run 触发时已经包含 crawl 刚推的那次提交，直接用它。
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5

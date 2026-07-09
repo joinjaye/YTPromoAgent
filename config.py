@@ -3,7 +3,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-YOUTUBE_API_KEY            = os.getenv("YOUTUBE_API_KEY")
+
+def _parse_youtube_keys() -> list[str]:
+    """
+    支持多个 YouTube API Key 轮换。优先读 YOUTUBE_API_KEYS，取不到再读旧的
+    YOUTUBE_API_KEY —— 两个变量都按逗号分隔支持写多个 key（.env 里已经在
+    YOUTUBE_API_KEY 塞了多个用逗号分开的 key，所以这里两个都要切分，
+    不能假设旧变量名下只有一个 key，否则会把整串逗号文本当成一个非法 key）。
+    """
+    raw = os.getenv("YOUTUBE_API_KEYS") or os.getenv("YOUTUBE_API_KEY", "")
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+YOUTUBE_API_KEYS            = _parse_youtube_keys()
+YOUTUBE_API_KEY             = YOUTUBE_API_KEYS[0] if YOUTUBE_API_KEYS else ""  # 向后兼容
 FEISHU_APP_ID              = os.getenv("FEISHU_APP_ID")
 FEISHU_APP_SECRET          = os.getenv("FEISHU_APP_SECRET")
 FEISHU_BITABLE_APP_TOKEN   = os.getenv("FEISHU_BITABLE_APP_TOKEN")

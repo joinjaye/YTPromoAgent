@@ -113,3 +113,59 @@ def save_leads(records: list[dict], created_at: int | None = None) -> list[dict]
                 new_records.append(r)
         conn.commit()
     return new_records
+
+
+def get_unsynced_leads() -> list[dict]:
+    """
+    本地已保存、但还没成功写入飞书的记录（feishu_record_id 为空）。
+    覆盖两种情况：本次运行刚新增的，以及之前运行飞书写入失败、遗留下来的历史记录 ——
+    每次运行都会重新尝试，直到真正同步成功为止，不会因为一次失败就永久丢失。
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM leads WHERE feishu_record_id = '' OR feishu_record_id IS NULL"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def mark_synced(id_record_pairs: list[tuple[int, str]]):
+    """把本地 leads.id 对应的记录标记为已同步到飞书（写入 record_id）。"""
+    if not id_record_pairs:
+        return
+    with _connect() as conn:
+        conn.executemany(
+            "UPDATE leads SET feishu_record_id = ? WHERE id = ?",
+            [(record_id, lead_id) for lead_id, record_id in id_record_pairs],
+        )
+        conn.commit()
+
+
+def reconcile_feishu_sync(live_records: list[dict]) -> int:
+    """
+    以飞书表格当前的实际数据（live_records，来自 feishu_client.fetch_all_records）为准，
+    校正本地 leads.feishu_record_id：
+      - 本地按 (video_url, promo_platform, promo_link) 能在线上匹配到 —— 写回 record_id
+        （覆盖"飞书其实写成功了，但本地标记步骤没跑到"这种半途失败场景，避免重复建行）
+      - 本地曾经标记为已同步，但线上已经找不到对应记录（记录被删 / 表被重建）—— 清空，
+        交给下一步 batch_create_records 重新写回飞书
+    返回被判定为"需要重新同步"的行数。
+    """
+    live_map = {
+        (r.get("video_url", ""), r.get("promo_platform", ""), r.get("promo_link", "")): r.get("feishu_record_id", "")
+        for r in live_records
+    }
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, video_url, promo_platform, promo_link, feishu_record_id FROM leads"
+        ).fetchall()
+        stale = 0
+        for row in rows:
+            key = (row["video_url"], row["promo_platform"], row["promo_link"])
+            live_id = live_map.get(key, "")
+            if live_id and live_id != row["feishu_record_id"]:
+                conn.execute("UPDATE leads SET feishu_record_id = ? WHERE id = ?", (live_id, row["id"]))
+            elif not live_id and row["feishu_record_id"]:
+                conn.execute("UPDATE leads SET feishu_record_id = '' WHERE id = ?", (row["id"],))
+                stale += 1
+        conn.commit()
+        return stale

@@ -16,6 +16,14 @@ _token_cache: str = ""
 _primary_field_name: str = ""  # cached from setup_table; used as auto-increment ID column
 
 
+class FeishuWriteError(RuntimeError):
+    """批量新增部分失败时，携带已经成功写入的 record_id，避免调用方把它们当成完全没写入。"""
+
+    def __init__(self, message: str, partial_record_ids: list[str] | None = None):
+        super().__init__(message)
+        self.partial_record_ids = partial_record_ids or []
+
+
 def _get_token() -> str:
     global _token_cache
     if _token_cache:
@@ -118,11 +126,15 @@ def setup_table():
 
 # ── 写入 ──────────────────────────────────────────────────────────────────────
 
-def batch_create_records(records: list[dict]):
+def batch_create_records(records: list[dict]) -> list[str]:
     """
     Write promo records to Feishu bitable.
     Each record: {youtuber, promo_platform, promo_link, video_url, published_at?}
     Primary field gets a sequential auto-increment ID sourced from local SQLite counter.
+
+    返回与 records 等长、顺序一致的 record_id 列表。若某个 500 条的分片失败，
+    之前已经成功的分片的 record_id 仍然通过 FeishuWriteError.partial_record_ids
+    带给调用方，避免下次重试时把已经写入的记录重复建行。
     """
     from db import allocate_record_ids
     ids = list(allocate_record_ids(len(records)))
@@ -143,6 +155,7 @@ def batch_create_records(records: list[dict]):
         fields_list.append(f)
 
     token = _get_token()
+    record_ids: list[str] = []
     for chunk in _chunks(fields_list, 500):
         resp = requests.post(
             _table_url("/batch_create"),
@@ -153,9 +166,64 @@ def batch_create_records(records: list[dict]):
         resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 0:
-            raise RuntimeError(f"[Lark] 批量新增失败: {data}")
+            raise FeishuWriteError(f"[Lark] 批量新增失败（已成功写入 {len(record_ids)} 条）: {data}", record_ids)
+        record_ids.extend(item["record_id"] for item in data["data"]["records"])
 
     print(f"[Lark] 已写入 {len(records)} 条记录")
+    return record_ids
+
+
+def _field_text(value) -> str:
+    """Normalize a Feishu text-field value: plain string or [{type,text},...] segments."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "".join(seg.get("text", "") for seg in value if isinstance(seg, dict))
+    return str(value)
+
+
+def fetch_all_records() -> list[dict]:
+    """
+    拉取飞书多维表格当前的全部记录（只读）。
+
+    用作"以线上表格数据为准"的校准基准 —— 本地 leads.feishu_record_id 可能因为
+    之前某次写入失败/超时而没记上，或者表格被手动清理过导致本地缓存过期；
+    每次运行前用这份实时数据校正，而不是死信本地那份可能已经不准的记录。
+    """
+    token = _get_token()
+    headers = _headers(token)
+    url = _table_url()
+
+    records: list[dict] = []
+    page_token = ""
+    while True:
+        params = {"page_size": 500}
+        if page_token:
+            params["page_token"] = page_token
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != 0:
+            raise RuntimeError(f"[Lark] 拉取记录失败: {body}")
+
+        data = body.get("data", {})
+        for item in data.get("items", []):
+            fields = item.get("fields", {})
+            records.append({
+                "youtuber":         _field_text(fields.get("Youtuber")),
+                "promo_platform":   _field_text(fields.get("推广平台")),
+                "promo_link":       _field_text(fields.get("推广链接")),
+                "video_url":        _field_text(fields.get("Video 链接")),
+                "feishu_record_id": item.get("record_id", ""),
+            })
+
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token", "")
+
+    return records
 
 
 # ── 群通知（卡片格式，逐条展示）─────────────────────────────────────────────
@@ -169,6 +237,14 @@ def batch_create_records(records: list[dict]):
 MAX_RECORDS_PER_CARD = 60
 
 
+def _content_date_label(records: list[dict]) -> str:
+    """视频内容本身的发布日期范围（区别于推送发生的时间）。"""
+    dates = sorted({r["published_at"][:10] for r in records if r.get("published_at")})
+    if not dates:
+        return ""
+    return dates[0] if dates[0] == dates[-1] else f"{dates[0]} ~ {dates[-1]}"
+
+
 def notify_new_records(records: list[dict]):
     if not FEISHU_WEBHOOK_URL:
         print("[Lark] 未配置 FEISHU_WEBHOOK_URL，跳过群通知")
@@ -176,12 +252,13 @@ def notify_new_records(records: list[dict]):
     if not records:
         return
 
+    date_label = _content_date_label(records)
     batches = list(_chunks(records, MAX_RECORDS_PER_CARD))
     for i, batch in enumerate(batches, start=1):
-        _send_card(batch, i, len(batches))
+        _send_card(batch, i, len(batches), date_label)
 
 
-def _send_card(records: list[dict], batch_index: int, batch_total: int):
+def _send_card(records: list[dict], batch_index: int, batch_total: int, date_label: str = ""):
     elements: list[dict] = []
     for i, r in enumerate(records):
         if i > 0:
@@ -215,6 +292,8 @@ def _send_card(records: list[dict], batch_index: int, batch_total: int):
     elements.append({"tag": "action", "actions": actions})
 
     title = f"🔍 发现 {len(records)} 条新推广记录"
+    if date_label:
+        title += f" · 视频日期 {date_label}"
     if batch_total > 1:
         title += f"（第 {batch_index}/{batch_total} 批）"
 

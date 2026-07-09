@@ -30,6 +30,11 @@ jobs:
         run: python main.py
 
       - name: Persist crawl log
+        # 兜底：main.py 内部已经把已知的失败模式都处理成"跳过继续、正常退出"，
+        # 这里加 if: always() 是最后一道防线 —— 就算 Run crawler 因为完全没预料到
+        # 的问题（比如依赖安装失败之外的运行时崩溃）以非 0 退出，只要本地 leads.db
+        # 里已经有数据，也要把它提交上去，不能让已经抓到的数据只留在 runner 里就被销毁。
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
