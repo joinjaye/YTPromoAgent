@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from config import (
@@ -237,9 +237,21 @@ def fetch_all_records() -> list[dict]:
 MAX_RECORDS_PER_CARD = 60
 
 
+CST = timezone(timedelta(hours=8))
+
+
 def _content_date_label(records: list[dict]) -> str:
-    """视频内容本身的发布日期范围（区别于推送发生的时间）。"""
-    dates = sorted({r["published_at"][:10] for r in records if r.get("published_at")})
+    """视频内容本身的发布日期范围（区别于推送发生的时间）。
+
+    published_at 是 YouTube 返回的 UTC 时间戳（"...Z"），而抓取窗口按北京时间
+    划分单日；直接对 UTC 字符串做 [:10] 切片会在 UTC 00:00 前后把同一个北京时间
+    日子拆成两个日期，因此这里先转换到北京时间再取日期。
+    """
+    dates = sorted({
+        datetime.strptime(r["published_at"], "%Y-%m-%dT%H:%M:%SZ")
+        .replace(tzinfo=timezone.utc).astimezone(CST).strftime("%Y-%m-%d")
+        for r in records if r.get("published_at")
+    })
     if not dates:
         return ""
     return dates[0] if dates[0] == dates[-1] else f"{dates[0]} ~ {dates[-1]}"
