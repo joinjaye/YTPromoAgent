@@ -2,6 +2,15 @@ name: PromoLeads Crawl
 
 on:
   workflow_dispatch:
+    inputs:
+      run_mode:
+        description: '执行模式：normal 会更新全部链路；channels_only 只更新频道链路'
+        required: true
+        default: normal
+        type: choice
+        options:
+          - normal
+          - channels_only
 
 jobs:
   crawl:
@@ -27,6 +36,8 @@ jobs:
         run: echo "${{ secrets.ENV_FILE }}" > .env
 
       - name: Run crawler
+        env:
+          PROMOLEADS_RUN_MODE: ${{ inputs.run_mode || 'normal' }}
         run: python main.py
 
       - name: Persist crawl log

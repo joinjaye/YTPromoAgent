@@ -3,7 +3,7 @@ name: Deploy Dashboard
 on:
   workflow_dispatch:
   workflow_run:
-    workflows: ["PromoLeads Crawl"]
+    workflows: ["PromoLeads Crawl", "Weekly AI Winsight"]
     types: [completed]
 
 permissions:

@@ -107,29 +107,76 @@ def _get_video_details(video_ids: list[str]) -> list[dict]:
 
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i + 50]
-        resp = _execute(lambda b=batch: _build_client().videos().list(id=",".join(b), part="snippet"))
+        resp = _execute(lambda b=batch: _build_client().videos().list(id=",".join(b), part="snippet,statistics"))
         for item in resp.get("items", []):
             snippet = item.get("snippet", {})
+            stats = item.get("statistics", {})
             results.append({
                 "video_id":      item["id"],
                 "video_url":     f"https://www.youtube.com/watch?v={item['id']}",
+                "channel_id":    snippet.get("channelId", ""),
                 "channel_title": snippet.get("channelTitle", ""),
                 "title":         snippet.get("title", ""),
                 "description":   snippet.get("description", ""),
                 "published_at":  snippet.get("publishedAt", ""),
+                "view_count":    int(stats.get("viewCount", 0)),
             })
     return results
 
 
-def fetch_videos_for_query(query: str, published_after: str | None = None, published_before: str | None = None) -> list[dict]:
-    mode = f"{published_after} ~ {published_before}" if published_after else "冷启动"
-    print(f"  [YouTube] {query!r}  [{mode}]")
+def _get_channel_details(channel_ids: list[str]) -> dict[str, dict]:
+    """Channel-level stats (subscriber count, country, activity totals), batched
+    in groups of 50 — cheap next to search.list (1 quota unit/call vs 100)."""
+    if not channel_ids:
+        return {}
+    result: dict[str, dict] = {}
+    unique_ids = list(dict.fromkeys(channel_ids))
 
-    video_ids = _search_video_ids(query, published_after, published_before, SEARCH_MAX_RESULTS)
+    for i in range(0, len(unique_ids), 50):
+        batch = unique_ids[i:i + 50]
+        resp = _execute(lambda b=batch: _build_client().channels().list(id=",".join(b), part="snippet,statistics"))
+        for item in resp.get("items", []):
+            snippet = item.get("snippet", {})
+            stats = item.get("statistics", {})
+            custom_url = snippet.get("customUrl", "")
+            profile_url = (
+                f"https://www.youtube.com/{custom_url}" if custom_url
+                else f"https://www.youtube.com/channel/{item['id']}"
+            )
+            result[item["id"]] = {
+                "subscriber_count":  int(stats.get("subscriberCount", 0)),
+                "country":           snippet.get("country", ""),
+                "channel_video_cnt": int(stats.get("videoCount", 0)),
+                "channel_view_cnt":  int(stats.get("viewCount", 0)),
+                "profile_url":       profile_url,
+            }
+    return result
+
+
+def fetch_videos_for_query(
+    query: str,
+    published_after: str | None = None,
+    published_before: str | None = None,
+    max_results: int | None = None,
+) -> list[dict]:
+    max_results = max_results if max_results is not None else SEARCH_MAX_RESULTS
+    mode = f"{published_after} ~ {published_before}" if published_after else "冷启动"
+    print(f"  [YouTube] {query!r}  [{mode}]  上限 {max_results} 条")
+
+    video_ids = _search_video_ids(query, published_after, published_before, max_results)
     if not video_ids:
         print(f"  [YouTube] 无新结果")
         return []
 
     videos = _get_video_details(video_ids)
+    channel_info = _get_channel_details([v["channel_id"] for v in videos if v["channel_id"]])
+    for v in videos:
+        info = channel_info.get(v["channel_id"], {})
+        v["subscriber_count"]  = info.get("subscriber_count", 0)
+        v["country"]           = info.get("country", "")
+        v["channel_video_cnt"] = info.get("channel_video_cnt", 0)
+        v["channel_view_cnt"]  = info.get("channel_view_cnt", 0)
+        v["profile_url"]       = info.get("profile_url", f"https://www.youtube.com/channel/{v['channel_id']}")
+
     print(f"  [YouTube] 获取到 {len(videos)} 条视频")
     return videos

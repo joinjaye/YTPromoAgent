@@ -1,0 +1,50 @@
+name: Weekly AI Winsight
+
+on:
+  schedule:
+    # Every Friday 09:00 Asia/Shanghai (GitHub cron uses UTC).
+    - cron: '0 1 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: weekly-ai-winsight
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install project dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Cursor Agent CLI
+        run: curl https://cursor.com/install -fsS | bash
+
+      - name: Generate weekly Winsight
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 weekly_insight.py
+
+      - name: Persist weekly Winsight
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/weekly_insight.json
+          git diff --staged --quiet || git commit -m "chore: update weekly AI Winsight [skip ci]"
+          git push

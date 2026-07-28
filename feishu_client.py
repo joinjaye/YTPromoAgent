@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -6,6 +7,8 @@ from config import (
     FEISHU_APP_SECRET,
     FEISHU_BITABLE_APP_TOKEN,
     FEISHU_BITABLE_TABLE_ID,
+    FEISHU_BITABLE_CHANNEL_APP_TOKEN,
+    FEISHU_BITABLE_CHANNEL_TABLE_ID,
     FEISHU_WEBHOOK_URL,
     DASHBOARD_URL,
 )
@@ -14,6 +17,7 @@ FEISHU_API_BASE = "https://open.larksuite.com/open-apis"
 
 _token_cache: str = ""
 _primary_field_name: str = ""  # cached from setup_table; used as auto-increment ID column
+_channel_primary_field_name: str = ""  # cached from setup_channel_table (channels 表，独立 Base/Table)
 
 
 class FeishuWriteError(RuntimeError):
@@ -49,6 +53,13 @@ def _table_url(suffix: str = "") -> str:
     return (
         f"{FEISHU_API_BASE}/bitable/v1/apps/{FEISHU_BITABLE_APP_TOKEN}"
         f"/tables/{FEISHU_BITABLE_TABLE_ID}/records{suffix}"
+    )
+
+
+def _channel_table_url(suffix: str = "") -> str:
+    return (
+        f"{FEISHU_API_BASE}/bitable/v1/apps/{FEISHU_BITABLE_CHANNEL_APP_TOKEN}"
+        f"/tables/{FEISHU_BITABLE_CHANNEL_TABLE_ID}/records{suffix}"
     )
 
 
@@ -122,6 +133,197 @@ def setup_table():
         print(f"[Lark] 新建字段: {', '.join(created)}")
     else:
         print("[Lark] 表结构已就绪")
+
+
+# ── 频道级（channels）同步 —— 独立的 Base/Table，跟上面 leads 那份不是同一个 ──
+
+_CHANNEL_FIELD_SCHEMA = [
+    # (field_name, type)  type 1=Text, 2=Number, 5=DateTime
+    # 没有单独的 "Channel ID" 字段 —— 主字段（表格第一列）已经改名叫
+    # "Channel ID" 并直接存 channel_id，不需要再开一列存第二遍。
+    ("Account Name",        1),
+    ("Profile URL",         1),
+    ("Followers",           2),
+    ("Country",             1),
+    ("Language",            1),
+    ("Market",              1),
+    ("Channel Video Count", 2),
+    ("Channel View Count",  2),
+    ("Keyword",             1),
+    ("推广平台",             1),
+    ("推广链接",             1),
+    ("Contact",             1),
+    ("累计观看数",           2),
+    ("抓取视频数",           2),
+    ("首次抓取",             5),
+    ("最近推广",             5),
+    ("更新状态",             1),
+]
+
+
+def setup_channel_table():
+    """
+    频道表结构初始化，逻辑跟 setup_table() 一致，只是指向独立的
+    FEISHU_BITABLE_CHANNEL_APP_TOKEN / FEISHU_BITABLE_CHANNEL_TABLE_ID。
+    安全重复调用——已存在的字段会跳过。
+    """
+    global _channel_primary_field_name
+    token = _get_token()
+    headers = _headers(token)
+    fields_url = (
+        f"{FEISHU_API_BASE}/bitable/v1/apps/{FEISHU_BITABLE_CHANNEL_APP_TOKEN}"
+        f"/tables/{FEISHU_BITABLE_CHANNEL_TABLE_ID}/fields"
+    )
+
+    resp = requests.get(fields_url, headers=headers, timeout=10)
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("code") != 0:
+        raise RuntimeError(f"[Lark] 获取频道表字段失败: {body}")
+    items = body.get("data", {}).get("items", [])
+    _channel_primary_field_name = items[0]["field_name"] if items else ""
+    existing_names = {f["field_name"] for f in items}
+
+    created = []
+    for name, ftype in _CHANNEL_FIELD_SCHEMA:
+        if name in existing_names:
+            continue
+        r = requests.post(
+            fields_url,
+            headers=headers,
+            json={"field_name": name, "type": ftype},
+            timeout=10,
+        )
+        r.raise_for_status()
+        r_body = r.json()
+        if r_body.get("code") != 0:
+            raise RuntimeError(f"[Lark] 新建频道字段 {name} 失败: {r_body}")
+        created.append(name)
+
+    if created:
+        print(f"[Lark] 频道表新建字段: {', '.join(created)}")
+    else:
+        print("[Lark] 频道表结构已就绪")
+
+
+_SEVEN_DAYS_MS = 7 * 24 * 3600 * 1000
+
+
+def _update_status(first_crawled_at, last_crawled_at) -> str:
+    """
+    「更新状态」判断逻辑：7 天内首次抓到 → 新增；不是新增但 7 天内又被抓到过
+    （字段有变化）→ 有更新；否则 → 存量。用于在多维表格里筛出"这周有动静"的
+    频道，跟纯历史存量区分开——注意这是"距今 7 天"，不是"运行这一轮"，所以
+    随时间推移会自然从 新增/有更新 变成 存量，只要这个频道被再次抓到时会
+    重新计算刷新，不需要额外的定时任务。
+    """
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if first_crawled_at and now - first_crawled_at <= _SEVEN_DAYS_MS:
+        return "新增"
+    if last_crawled_at and now - last_crawled_at <= _SEVEN_DAYS_MS:
+        return "有更新"
+    return "存量"
+
+
+def _build_channel_fields(row: dict) -> dict:
+    """把 db.channels 的一行映射成飞书字段。`videos` 是 JSON 数组，这里只取
+    数量和"最新一条的发布时间"，不会把完整视频列表塞进多维表格。主字段
+    （已改名叫 "Channel ID" 的第一列）写 channel_id，作为跟飞书线上数据对账、
+    判断新增/更新的唯一标识——只存这一处，不再另开一个同名字段重复存一遍。"""
+    try:
+        videos = json.loads(row.get("videos") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        videos = []
+
+    fields: dict = {
+        "Account Name":        row.get("account_name", ""),
+        "Profile URL":         row.get("profile_url", ""),
+        "Followers":           row.get("followers", 0),
+        "Country":             row.get("country", ""),
+        "Language":            row.get("language", ""),
+        "Market":              row.get("market", ""),
+        "Channel Video Count": row.get("channel_video_cnt", 0),
+        "Channel View Count":  row.get("channel_view_cnt", 0),
+        "Keyword":             row.get("keyword", ""),
+        "推广平台":             row.get("promo_platform", ""),
+        "推广链接":             row.get("promo_link", ""),
+        "Contact":              row.get("contact", ""),
+        "累计观看数":           row.get("total_views", 0),
+        "抓取视频数":           len(videos),
+        "更新状态":             _update_status(row.get("first_crawled_at"), row.get("last_crawled_at")),
+    }
+    if row.get("first_crawled_at"):
+        fields["首次抓取"] = row["first_crawled_at"]
+    if videos:
+        latest_ms = _to_ms(videos[0].get("published_at", ""))
+        if latest_ms is not None:
+            fields["最近推广"] = latest_ms
+    # 主字段（不管叫什么名字，取表里已有的第一个字段）统一写 channel_id，
+    # 用它做人类肉眼之外、程序对账时的稳定唯一标识；Account Name 单独也有
+    # 一列，人读的时候看那一列。
+    if _channel_primary_field_name:
+        fields[_channel_primary_field_name] = row.get("channel_id", "")
+    return fields
+
+
+def batch_create_channel_records(channels: list[dict]) -> list[str]:
+    """
+    新增频道记录，返回与 channels 等长、顺序一致的 record_id 列表。跟
+    batch_create_records（leads）不同，这里不需要本地自增 ID 当主字段——
+    Account Name 本身就是人类可读的值，不用造一个序号。
+    """
+    if not channels:
+        return []
+    fields_list = [_build_channel_fields(c) for c in channels]
+
+    token = _get_token()
+    record_ids: list[str] = []
+    for chunk in _chunks(fields_list, 500):
+        resp = requests.post(
+            _channel_table_url("/batch_create"),
+            headers=_headers(token),
+            json={"records": [{"fields": f} for f in chunk]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise FeishuWriteError(f"[Lark] 频道批量新增失败（已成功写入 {len(record_ids)} 条）: {data}", record_ids)
+        record_ids.extend(item["record_id"] for item in data["data"]["records"])
+
+    print(f"[Lark] 频道表已新增 {len(channels)} 条记录")
+    return record_ids
+
+
+def batch_update_channel_records(channels: list[dict]) -> None:
+    """
+    更新已经同步过的频道记录（每条都带上已知的 feishu_record_id）。这是频道
+    同步跟 leads 那条 append-only 流程的核心区别：channels 的字段会随着抓取
+    持续变化（market/推广平台并集、contact 补齐、videos 累加……），已经同步
+    过的频道只要这一轮又被碰到，就要重新推一次最新状态，不是"同步过就不用
+    再管"。
+    """
+    if not channels:
+        return
+    token = _get_token()
+    for chunk in _chunks(channels, 500):
+        payload = {
+            "records": [
+                {"record_id": c["feishu_record_id"], "fields": _build_channel_fields(c)}
+                for c in chunk
+            ]
+        }
+        resp = requests.post(
+            _channel_table_url("/batch_update"),
+            headers=_headers(token),
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"[Lark] 频道批量更新失败: {data}")
+    print(f"[Lark] 频道表已更新 {len(channels)} 条记录")
 
 
 # ── 写入 ──────────────────────────────────────────────────────────────────────
@@ -216,6 +418,44 @@ def fetch_all_records() -> list[dict]:
                 "promo_platform":   _field_text(fields.get("推广平台")),
                 "promo_link":       _field_text(fields.get("推广链接")),
                 "video_url":        _field_text(fields.get("Video 链接")),
+                "feishu_record_id": item.get("record_id", ""),
+            })
+
+        if not data.get("has_more"):
+            break
+        page_token = data.get("page_token", "")
+
+    return records
+
+
+def fetch_all_channel_records() -> list[dict]:
+    """
+    拉取飞书频道表当前的全部记录（只读），只取 Channel ID + record_id 用于
+    对账。用途跟 fetch_all_records（leads）一样：本地 channels.feishu_record_id
+    可能因为写入失败/超时没记上，或者表格被手动清理过导致本地缓存过期——
+    每次同步前用线上实际数据校正，避免同一个频道被误判成"新的"而重复建行。
+    """
+    token = _get_token()
+    headers = _headers(token)
+    url = _channel_table_url()
+
+    records: list[dict] = []
+    page_token = ""
+    while True:
+        params = {"page_size": 500}
+        if page_token:
+            params["page_token"] = page_token
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("code") != 0:
+            raise RuntimeError(f"[Lark] 拉取频道记录失败: {body}")
+
+        data = body.get("data", {})
+        for item in data.get("items", []):
+            fields = item.get("fields", {})
+            records.append({
+                "channel_id":       _field_text(fields.get("Channel ID")),
                 "feishu_record_id": item.get("record_id", ""),
             })
 

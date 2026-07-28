@@ -1,6 +1,9 @@
 import re
 from urllib.parse import urlparse, parse_qs, unquote
-from config import SEARCH_KEYWORDS
+
+from langdetect import detect, LangDetectException
+
+from config import SEARCH_KEYWORDS, MARKET_BY_LANGUAGE
 
 _YT_REDIRECT_RE = re.compile(
     r'https?://(?:www\.)?youtube\.com/redirect\?[^\s<>"]*',
@@ -156,3 +159,126 @@ def extract_promo_links(description: str) -> list[dict]:
         _emit(url)
 
     return results
+
+
+# ── Channel-level enrichment: contact info, language, market ──────────────
+
+_SOCIAL_PATTERNS: dict[str, re.Pattern] = {
+    "twitter": re.compile(
+        r'https?://(?:www\.)?(?:twitter|x)\.com/(?!intent/|home$|share|hashtag|search)[^\s<>"()\[\]]+',
+        re.IGNORECASE,
+    ),
+    "telegram": re.compile(
+        r'https?://(?:t|telegram)\.me/[^\s<>"()\[\]]+',
+        re.IGNORECASE,
+    ),
+    "instagram": re.compile(
+        r'https?://(?:www\.)?instagram\.com/[^\s<>"()\[\]]+',
+        re.IGNORECASE,
+    ),
+    "tiktok": re.compile(
+        r'https?://(?:(?:www\.|vm\.|vt\.)?tiktok\.com)[^\s<>"()\[\]]+',
+        re.IGNORECASE,
+    ),
+    "facebook": re.compile(
+        r'https?://(?:www\.)?(?:facebook|fb)\.com/[^\s<>"()\[\]]+',
+        re.IGNORECASE,
+    ),
+}
+
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+_EMAIL_SKIP_DOMAINS = {"youtube.com", "google.com", "example.com", "youtu.be", "gmail.com"}
+
+
+def extract_social_links(text: str) -> dict[str, str]:
+    """Return first URL found per social platform. Keys: twitter/telegram/instagram/tiktok/facebook."""
+    result: dict[str, str] = {}
+    for platform, pattern in _SOCIAL_PATTERNS.items():
+        m = pattern.search(text)
+        if m:
+            result[platform] = m.group(0).rstrip(".,;:)")
+    return result
+
+
+def extract_emails(text: str) -> list[str]:
+    """Extract unique non-system email addresses from text."""
+    seen: set[str] = set()
+    emails: list[str] = []
+    for m in _EMAIL_RE.finditer(text):
+        email = m.group(0).lower()
+        domain = email.split("@")[1]
+        if domain not in _EMAIL_SKIP_DOMAINS and email not in seen:
+            emails.append(email)
+            seen.add(email)
+    return emails
+
+
+_HASHTAG_RE = re.compile(r'#[^\s#]+')
+
+
+def extract_hashtags(text: str) -> list[str]:
+    """
+    Unique hashtags (lowercased, first-seen order) from free text. On YouTube
+    these live almost entirely in the description (a tag block), not the
+    title — this must be called on description text (or title+description)
+    to find anything real; title alone returns near-nothing in practice.
+    """
+    seen: set[str] = set()
+    tags: list[str] = []
+    for m in _HASHTAG_RE.finditer(text):
+        tag = m.group(0).lower()
+        if tag not in seen:
+            tags.append(tag)
+            seen.add(tag)
+    return tags
+
+
+def detect_language(text: str) -> str:
+    """Best-effort ISO 639-1 language code for a video's title+description, '' if undetectable."""
+    text = text.strip()
+    if not text:
+        return ""
+    try:
+        return detect(text)
+    except LangDetectException:
+        return ""
+
+
+def classify_market(country: str, language: str) -> str:
+    """
+    Best-effort market for a channel — not restricted to a curated shortlist.
+    `country` (real channel country from channels.list) always wins when it
+    looks like a valid ISO 3166-1 alpha-2 code; `language` (detected from
+    title+description) is only a fallback for channels the API didn't report
+    a country for. '' only when neither signal is available.
+    """
+    country = (country or "").strip().upper()
+    if len(country) == 2 and country.isalpha():
+        return country
+    return MARKET_BY_LANGUAGE.get((language or "").lower(), "")
+
+
+# ── Title-based platform fallback ──────────────────────────────────────────
+# extract_promo_links only looks at links in the description — a video whose
+# title plainly names a known exchange but whose description has no matchable
+# link (or no link at all) still shouldn't read as "unmatched". This scans
+# free text (typically the title) for a known brand as a standalone word,
+# reusing the same brand list _match_platform uses for URLs.
+
+_TITLE_WORD_RE = re.compile(r'[a-z0-9]+', re.IGNORECASE)
+
+
+def match_platform_in_text(text: str) -> str:
+    """Return the display name of the first known platform brand named in
+    free text (word-boundary match), or '' if none is found."""
+    if not text:
+        return ""
+    words = {w.lower() for w in _TITLE_WORD_RE.findall(text)}
+    text_lower = text.lower()
+    for brand, concat, display in _PLATFORMS:
+        if '.' in brand:
+            if brand in text_lower:
+                return display
+        elif brand in words:
+            return display
+    return ""
