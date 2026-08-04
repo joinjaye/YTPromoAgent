@@ -44,6 +44,7 @@ DB_PATH  = Path(__file__).parent / "data" / "leads.db"
 OUT_DIR  = Path(__file__).parent / "site"
 OUT_PATH = OUT_DIR / "index.html"
 CHANNELS_OUT_PATH = OUT_DIR / "channels" / "index.html"
+CHANNELS_LARK_URL = "https://skyrocket.sg.larksuite.com/base/A35sbGSpRamdsistOZqlbWrOg9b?table=tblXmEt7PVgj9sll&view=vewAyQ6xXp"
 VOLUME_OUT_PATH = OUT_DIR / "volume" / "index.html"
 INSIGHT_PATH = Path(__file__).parent / "data" / "weekly_insight.json"
 
@@ -419,6 +420,16 @@ def generate_html(
         if volume_page else ""
     )
     guide_drawer_html = _volume_guide_html() if volume_page else ""
+    channels_lark_link_html = (
+        f'<a class="table-external-link" href="{CHANNELS_LARK_URL}" target="_blank" '
+        'rel="noopener noreferrer" aria-label="在新窗口打开 Lark 频道表格">'
+        '<svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" '
+        'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<path d="M14 5h5v5"/><path d="M10 14 19 5"/>'
+        '<path d="M19 13v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/>'
+        '</svg><span>打开 Lark 表格</span></a>'
+        if channels_page else ""
+    )
 
     html_output = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -572,6 +583,17 @@ body.guide-opened {{ overflow:hidden; }}
 
 .table-card {{ background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:20px; }}
 .table-card > h3 {{ font-size:14px; color:var(--text-1); font-weight:600; margin-bottom:16px; }}
+.table-card-header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:10px; }}
+.table-card-header h3 {{ min-width:0; color:var(--text-1); font-size:14px; font-weight:600; }}
+.table-external-link {{
+  flex:0 0 auto; min-height:44px; display:inline-flex; align-items:center; justify-content:center; gap:7px;
+  padding:9px 14px; border:1px solid var(--border-h); border-radius:7px; color:var(--text-1);
+  background:rgba(255,0,51,.08); font-size:12px; font-weight:600; line-height:1; text-decoration:none;
+  cursor:pointer; touch-action:manipulation; transition:color .15s ease,background-color .15s ease,border-color .15s ease;
+}}
+.table-external-link:hover {{ color:var(--cyan); background:rgba(255,0,51,.15); }}
+.table-external-link:active {{ background:rgba(255,0,51,.22); }}
+.table-external-link:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
 .table-toolbar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap; }}
 .table-toolbar input {{
   background:var(--surface); border:1px solid var(--border); border-radius:6px;
@@ -977,7 +999,10 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
     </div>
 
     <div class="table-card">
-      <h3>频道明细（按频道去重合并，含未识别推广平台的频道）</h3>
+      <div class="table-card-header">
+        <h3>频道明细（按频道去重合并，含未识别推广平台的频道）</h3>
+        {channels_lark_link_html}
+      </div>
       <div class="hint">点击一行展开，查看该频道逐条抓到的视频（发布时间 / 观看数）</div>
       <div class="table-toolbar">
         <div class="table-meta" id="meta-channels"></div>
