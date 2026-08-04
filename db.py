@@ -241,7 +241,7 @@ def _merge_contact(existing: str, social: dict[str, str], emails: list[str]) -> 
 def _merge_videos(existing_json: str, new_video: dict) -> tuple[str, int]:
     """
     Merge one newly-seen video into the channel's full video list, deduped by
-    video_url (re-sighting a video refreshes its view_count/title), sorted by
+    video_url (re-sighting may refresh text but preserves first-capture metrics), sorted by
     published_at descending. Returns (videos_json, total_views) where
     total_views is the sum of view_count across every video captured for this
     channel so far — this is a crawl-observed total, distinct from
@@ -253,17 +253,44 @@ def _merge_videos(existing_json: str, new_video: dict) -> tuple[str, int]:
     except (json.JSONDecodeError, TypeError):
         videos = []
     if new_video.get("video_url"):
-        by_url = {v["video_url"]: v for v in videos}
-        by_url[new_video["video_url"]] = {
+        by_url = {v.get("video_url"): v for v in videos if v.get("video_url")}
+        previous = by_url.get(new_video["video_url"], {})
+        merged = {
             "video_url":     new_video["video_url"],
             "video_title":   new_video.get("video_title", ""),
             "description":   new_video.get("description", ""),
             "published_at":  new_video.get("published_at", ""),
-            "view_count":    new_video.get("view_count", 0),
+            "view_count":    new_video.get("view_count"),
+            "like_count":    new_video.get("like_count"),
+            "comment_count": new_video.get("comment_count"),
+            "duration":      new_video.get("duration"),
+            "first_captured_at": new_video.get("first_captured_at"),
+            "observation_age_hours": new_video.get("observation_age_hours"),
+            "backfill_view_count": new_video.get("backfill_view_count"),
+            "backfill_like_count": new_video.get("backfill_like_count"),
+            "backfill_comment_count": new_video.get("backfill_comment_count"),
+            "backfill_captured_at": new_video.get("backfill_captured_at"),
+            "backfill_observation_age_hours": new_video.get("backfill_observation_age_hours"),
             "hashtags":      new_video.get("hashtags", []),
         }
+        snapshot_fields = {
+            "view_count", "like_count", "comment_count", "duration",
+            "first_captured_at", "observation_age_hours",
+        }
+        combined = dict(previous)
+        for key, value in merged.items():
+            # A same-day rerun must not turn the first-capture snapshot into a
+            # later refresh.  Old JSON can still receive newly available fields
+            # when that key was absent/null, without fabricating history.
+            if key in snapshot_fields and previous.get(key) is not None:
+                combined[key] = previous[key]
+            elif value is None or value == "":
+                combined[key] = previous.get(key, value)
+            else:
+                combined[key] = value
+        by_url[new_video["video_url"]] = combined
         videos = sorted(by_url.values(), key=lambda v: v.get("published_at", ""), reverse=True)
-    total_views = sum(v.get("view_count", 0) for v in videos)
+    total_views = sum(v.get("view_count") or 0 for v in videos)
     return json.dumps(videos, ensure_ascii=False), total_views
 
 
@@ -292,6 +319,16 @@ def upsert_channel(row: dict) -> None:
         "description":  row.get("description", ""),
         "published_at": row.get("published_at", ""),
         "view_count":   row.get("view_count", 0),
+        "like_count":   row.get("like_count"),
+        "comment_count": row.get("comment_count"),
+        "duration":     row.get("duration"),
+        "first_captured_at": row.get("first_captured_at"),
+        "observation_age_hours": row.get("observation_age_hours"),
+        "backfill_view_count": row.get("backfill_view_count"),
+        "backfill_like_count": row.get("backfill_like_count"),
+        "backfill_comment_count": row.get("backfill_comment_count"),
+        "backfill_captured_at": row.get("backfill_captured_at"),
+        "backfill_observation_age_hours": row.get("backfill_observation_age_hours"),
         "hashtags":     row.get("hashtags") or [],
     }
 

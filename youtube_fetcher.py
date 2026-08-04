@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -107,10 +108,23 @@ def _get_video_details(video_ids: list[str]) -> list[dict]:
 
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i + 50]
-        resp = _execute(lambda b=batch: _build_client().videos().list(id=",".join(b), part="snippet,statistics"))
+        resp = _execute(lambda b=batch: _build_client().videos().list(
+            id=",".join(b), part="snippet,statistics,contentDetails"
+        ))
+        captured_at = datetime.now(timezone.utc)
         for item in resp.get("items", []):
             snippet = item.get("snippet", {})
             stats = item.get("statistics", {})
+            content = item.get("contentDetails", {})
+            published_at = snippet.get("publishedAt", "")
+            observation_age_hours = None
+            try:
+                published_dt = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+                observation_age_hours = round(
+                    max(0.0, (captured_at - published_dt).total_seconds() / 3600), 2
+                )
+            except (TypeError, ValueError):
+                pass
             results.append({
                 "video_id":      item["id"],
                 "video_url":     f"https://www.youtube.com/watch?v={item['id']}",
@@ -118,8 +132,13 @@ def _get_video_details(video_ids: list[str]) -> list[dict]:
                 "channel_title": snippet.get("channelTitle", ""),
                 "title":         snippet.get("title", ""),
                 "description":   snippet.get("description", ""),
-                "published_at":  snippet.get("publishedAt", ""),
-                "view_count":    int(stats.get("viewCount", 0)),
+                "published_at":  published_at,
+                "view_count":    int(stats["viewCount"]) if "viewCount" in stats else None,
+                "like_count":    int(stats["likeCount"]) if "likeCount" in stats else None,
+                "comment_count": int(stats["commentCount"]) if "commentCount" in stats else None,
+                "duration":      content.get("duration") or None,
+                "first_captured_at": captured_at.isoformat(timespec="seconds"),
+                "observation_age_hours": observation_age_hours,
             })
     return results
 

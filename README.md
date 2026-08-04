@@ -36,7 +36,7 @@ promoLeads/
 ├── site/                           # reporter.py 的构建产物
 │   ├── index.html                  # 主看板：/
 │   ├── channels/index.html         # 频道分析：/channels/
-│   └── volume/index.html           # 竞品声量：/volume/
+│   └── volume/index.html           # 竞品 YouTube 推广表现：/volume/
 └── .github/workflows/
     ├── crawl.yml                   # 执行抓取并提交 data/leads.db
     ├── pages.yml                   # 构建并部署整个 site 目录
@@ -50,7 +50,7 @@ PromoLeads Crawl
   │
   ├─ 1. 抓取北京时间前一天发布的视频
   │     ├─ search.list：逐关键词搜索
-  │     ├─ videos.list：标题、描述、发布时间、播放量
+  │     ├─ videos.list：标题、描述、发布时间、首采播放/点赞/评论、时长
   │     └─ channels.list：订阅数、国家、频道总视频/播放量
   │
   ├─ 2. 同一批视频走两条数据路径
@@ -137,7 +137,7 @@ PROMOLEADS_RUN_MODE=channels_only python3 main.py
 | `first_crawled_at` / `last_crawled_at` | 首次和最近抓取时间 |
 | `feishu_record_id` | Channel 飞书表中的记录 ID |
 
-`videos` 每项保存：
+`videos` 每项保存首次抓取快照（新字段上线前的历史项可能缺失对应键）：
 
 ```json
 {
@@ -146,6 +146,11 @@ PROMOLEADS_RUN_MODE=channels_only python3 main.py
   "description": "...",
   "published_at": "...",
   "view_count": 0,
+  "like_count": 0,
+  "comment_count": 0,
+  "duration": "PT3M12S",
+  "first_captured_at": "2026-08-03T02:00:00+00:00",
+  "observation_age_hours": 24.5,
   "hashtags": []
 }
 ```
@@ -154,8 +159,9 @@ PROMOLEADS_RUN_MODE=channels_only python3 main.py
 SQLite，普通静态页面不会嵌入原文；周度 Winsight 会在生成阶段读取、清洗和限长后
 用于内容分析。
 
-`total_views` 是系统抓到的视频累计播放量，不等于 `channel_view_cnt`。后者是频道
-所有公开视频的全站历史播放量。
+`total_views` 是系统抓到的视频首采播放量之和，不等于 `channel_view_cnt`。后者是频道
+所有公开视频的全站历史播放量。同日任务重跑不会覆盖已保存的首采表现，只会补齐原先
+缺失的新字段。
 
 ## 三个独立页面
 
@@ -191,50 +197,68 @@ SQLite，普通静态页面不会嵌入原文；周度 Winsight 会在生成阶�
   最近内容日期、最近抓取日期、首次抓取日期
 - 点击频道行可展开逐条视频的发布时间、播放量、标题和链接
 
-### 竞品声量 `/volume/`
+### 竞品 YouTube 推广表现 `/volume/`
 
-只呈现 `CORE_COMPETITOR_KEYWORDS`：Weex、Bitunix、Blofin、BingX、Zoomex、
-LBank、Phemex。核心竞品使用更宽的搜索翻页上限，非核心关键词不进入时间窗口对比。
+只呈现 `CORE_COMPETITOR_KEYWORDS`：Weex、Bitunix、Blofin、BingX、Zoomex。
+核心竞品使用更宽的搜索翻页上限，非核心关键词不进入时间窗口对比。
 
-声量口径是指定窗口内识别到推广平台的视频记录，不包含评论区提及，因此不能与外部
-社媒监听工具的绝对值直接比较。
+比较口径统一按 `competitor × video_url` 去重。一条视频可分别计入多个竞品，但同一
+竞品下不会因多个推广链接重复计数；页面同时保留“推广记录数”用于解释原始链接规模。
+Promotion Share 是单个竞品去重推广视频数除以五个核心竞品视频数之和，只代表当前
+系统覆盖范围，不是全网声量份额。
 
 页面包含：
 
-- 7/14/30 天窗口和 4/6/8 个对比窗口
-- 7 天窗口固定为自然周周五至周四；14/30 天为滑动窗口
-- 周度视频数量与 WoW 对照，`|WoW| ≥ 30%` 高亮
-- 视频数量趋势
-- 最新窗口“视频数量 × 已覆盖累计播放量”双轴组合图
-- 语言构成、Top 15 Hashtag 和覆盖率提示
-- 账号数、Top1 账号占比、集中信号、标题重复度和模板化信号
-- 点击平台/窗口视频数展开账号、市场、语言、播放量、标题和链接
-- 顶部展示最近一次成功生成的 Weekly AI Winsight
+- 可指定任意起止日期，7/14/30 天只作为快捷期间；4/6/8 个趋势期间按所选期间长度向前拆分
+- 竞品矩阵、KPI 和结构视图直接使用指定期间，不与 Weekly Insight 的自然周窗口绑定
+- 决策 KPI（含 Promotion Share 领先者与份额提升最大竞品）、竞品表现矩阵；GR（指定期间相对上一同长期间）仅在 `|比例| ≥ 30%` 且
+  `|视频数变化| ≥ 3` 时显著高亮
+- 页面顶部全局筛选器：窗口、自定义起止日期、市场、语言、推广方式、内容主题、账号/标题搜索和竞品；
+  同时驱动 KPI、矩阵、周度概览、全部图表和已展开的视频明细，并支持一键重置；竞品按钮数量按当前窗口计算
+- 页面按“当前格局 → 分期规模与份额 → 趋势 → 结构/表现拆解 → 视频明细”的总分顺序组织
+- 顶部栏的“使用指南”以可搜索侧边抽屉解释核心计数、账号字段、推广方式、内容主题、首采表现与结构信号的程序判定逻辑
+- 推广规模 × brand-led 占比、推广规模 × 首采播放中位数气泡图
+- 4/6/8 个窗口的去重视频与 Promotion Share 趋势
+- 内容主题、推广方式、语言/市场热力图，以及账号集中度、新观察/连续账号对比
+- 四个结构视图均显示当前期间、筛选后样本数和生效条件；直接选择主题、推广方式、市场或语言时，对应视图只保留选中维度
+- 点击竞品或周度数字展开账号、市场、语言、推广方式、主题、首采表现、观察时长、
+  可点击的视频标题及同视频推广平台数
+- 视频明细中的标签保持简洁展示，通过行内“查看判定依据”稳定展开推广方式原因和主题命中词，不依赖鼠标悬停
+- 视频标题未采集时显示明确的缺失状态，并在明细标题区展示当前窗口标题覆盖数；占位文本仍可点击原视频
+- Insight 内折叠展示必要的数据覆盖与口径提示，不在业务分析主流程中单独占用一个板块
+- 顶部继续展示最近一次成功生成的 Weekly AI Insight（兼容旧 JSON）
 
 播放量按竞品和去重 `video_url` 求和。未能关联到 `channels.videos` 的历史记录不会
 被虚构播放量，页面会显示实际覆盖率。
+
+`volume_backfill.py` 只对数据库里已经存在的核心竞品视频 URL 调用低配额的
+`videos.list`/`channels.list`，不会扩展搜索、写 Leads、同步飞书或触发其他看板流程。
+可从 Leads 入库时间恢复的首次抓取时间和观察时长会按正常 Channel 视频结构持久化；
+补采时点取得的累计播放、点赞、评论则保存在独立 `backfill_*` 字段，只在明细与覆盖率
+中标为“历史补采统计”，绝不替代缺失的首采指标。
 
 ## Weekly AI Winsight
 
 `weekly_insight.py` 读取最新完整的周五至周四自然周，并与前一周比较。程序负责从
 SQLite 计算真实指标，Cursor Agent 只负责内容归纳。
 
-输入包括：
+输入由 Python 统一计算，包括：
 
-- 视频数量及 WoW
-- 已覆盖视频累计播放量和单条效率
-- 独立账号数、Top1 占比及集中信号
+- 去重推广视频数、Promotion Share 及 WoW
+- 独立账号、新观察账号、连续推广账号、Top1/Top3 占比及集中信号
+- 推广方式、内容主题、语言和市场结构
 - 标题重复度与模板化信号
-- 语言、市场和 Hashtag
-- 视频 description 内容样本及覆盖率
+- 首采播放中位数、早期高表现、初始互动率及各项覆盖率
+- 高首采播放视频的清洗后内容样本
+- Zoomex 与其他竞品中位水平的差异
 
 Description 样本优先选择高播放视频，同时保留不同作者的代表样本。URL、推广码等
 噪声会被清洗，单条长度和单平台样本数受限；模型不得引用 description 原文或补造
 活动信息。
 
-输出格式为：一句大盘结论、7 个竞品各一段 3–4 句运营分析，以及必要的覆盖率提示。
-每段重点区分铺量和有效观看，识别高播放内容、重复主题、语言/市场/KOL 结构，并给出
-下周选题、KOL 投放或活动承接建议。
+输出格式为：一句整体结论、2–4 条本周核心竞品洞察、Zoomex 对照、下周关注和必要
+的覆盖率提示。无明显变化的竞品不强制逐一罗列；首采播放只作为早期观看信号，不被
+表述为有效观看、最终触达或完整生命周期表现。
 
 结果写入 `data/weekly_insight.json`：
 
@@ -337,6 +361,12 @@ python3 main.py
 # 从当前 leads.db + weekly_insight.json 生成三个静态页面
 python3 reporter.py
 
+# 只重建竞品 YouTube 推广表现页
+python3 reporter.py --page volume
+
+# 仅用现有核心竞品 URL 定向补齐指定窗口的 Volume 数据，不调用 search.list
+python3 volume_backfill.py --start 2026-07-24 --end 2026-07-30
+
 # 手动生成最新完整自然周 Winsight（需要 CURSOR_API_KEY）
 python3 weekly_insight.py
 
@@ -358,7 +388,7 @@ python3 backfill_feishu.py
 SEARCH_MAX_RESULTS = 50
 CORE_SEARCH_MAX_RESULTS = 500
 CORE_COMPETITOR_KEYWORDS = {
-    "weex", "bitunix", "blofin", "bingx", "zoomex", "lbank", "phemex"
+    "weex", "bitunix", "blofin", "bingx", "zoomex"
 }
 ```
 
@@ -381,11 +411,20 @@ CORE_COMPETITOR_KEYWORDS = {
 ## 数据口径与已知限制
 
 - YouTube 搜索 API 的发布时间过滤会在本地再次校验，确保落在北京时间前一天窗口。
-- Leads 的“视频数量”本质是推广记录计数；播放量聚合会按 `video_url` 去重。
+- Leads 仍是推广记录；竞品比较则按 `competitor × video_url` 去重，并明确展示两种数量。
 - 历史 Leads 早于 Channels 功能上线时，可能无法关联语言、标题、Hashtag、Description
   或播放量。页面和 Winsight 必须按覆盖率降级，不回推缺失数字。
 - `channel_view_cnt` 是频道全站规模；`total_views` 是系统抓取到的视频播放量，两者不能
   混用。
-- 视频播放量是生成时累计快照。不同发布日期的累积时间不同，因此 Winsight 不做播放量
-  WoW，只用当前窗口播放量判断内容效率。
+- 播放、点赞、评论是发布次日首次抓取时的单次快照；系统不刷新历史视频，不提供
+  T+24h/T+72h/T+7d、增长速度、7 日互动率或完整生命周期指标。
+- 历史视频可能缺少点赞、评论、时长和观察时长；缺失值保持为空，不回推、不虚构为 0。
+- 对历史 URL 定向补采得到的是补采时点累计值，并非历史首采值；这些值独立存储，
+  不参与首采互动率、首采中位数或早期高表现计算。
+- 初始互动率为 `(首采点赞 + 首采评论) / 首采播放`；播放为 0 或任一必要字段缺失时为空。
+- 早期高表现只在相同观察时长区间内、样本达到 5 条后计算首采播放前 20%；当前无法
+  仅凭已有字段可靠区分 Shorts 与普通视频，因此不猜测内容形态。
+- “新观察账号”仅表示本系统首次观察到该账号推广某竞品，不等于真实首次合作。
+- 语言推断不等于真实用户市场；官方频道仅使用 `OFFICIAL_COMPETITOR_CHANNEL_IDS`
+  中明确维护的频道 ID，未配置时不猜测。
 - 系统只抓 YouTube，不包含评论区或其他社交平台，不能与社媒监听绝对值直接比较。

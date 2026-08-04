@@ -22,17 +22,23 @@ Usage:
 import json
 import html
 import sqlite3
+import argparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from config import CORE_COMPETITOR_KEYWORDS
+from config import (
+    CONTENT_TOPIC_KEYWORDS, CORE_COMPETITOR_DISPLAY_NAMES,
+    CORE_COMPETITOR_KEYWORDS, EARLY_PERFORMANCE_MIN_SAMPLE,
+    WOW_HIGHLIGHT_ABS_CHANGE, WOW_HIGHLIGHT_PERCENT,
+)
 from link_extractor import _PLATFORMS
+from competitor_analysis import build_report_payload, build_video_facts
 
 # Display-cased platform names for the core competitor set (e.g. "weex" -> "Weex"),
 # resolved once from the same brand list link_extractor.py uses for matching — so
 # editing config.CORE_COMPETITOR_KEYWORDS automatically flows through to the
 # 竞品声量 tab without touching this file.
-CORE_COMPETITOR_PLATFORMS = [display for brand, _, display in _PLATFORMS if brand in CORE_COMPETITOR_KEYWORDS]
+CORE_COMPETITOR_PLATFORMS = list(CORE_COMPETITOR_DISPLAY_NAMES.values())
 
 DB_PATH  = Path(__file__).parent / "data" / "leads.db"
 OUT_DIR  = Path(__file__).parent / "site"
@@ -44,9 +50,9 @@ INSIGHT_PATH = Path(__file__).parent / "data" / "weekly_insight.json"
 CST = timezone(timedelta(hours=8))
 
 CHART_COLORS = [
-    "#3B82F6", "#22D3EE", "#8B5CF6", "#10B981",
-    "#F59E0B", "#EF4444", "#EC4899", "#F97316",
-    "#A78BFA", "#34D399", "#60A5FA", "#FCD34D",
+    "#D85C72", "#FF7A45", "#F3BA4B", "#B96BC7",
+    "#FF2D46", "#E88B6A", "#FFD166", "#9F5F80",
+    "#F08A9B", "#D79057", "#C97A9A", "#E6A63C",
 ]
 
 
@@ -189,24 +195,118 @@ def _insight_html(payload: dict) -> str:
 
     esc = lambda value: html.escape(str(value or ""))
     bullets = lambda values: "".join(f"<li>{esc(v)}</li>" for v in values if isinstance(v, str))
+    def preview(value: str, limit: int = 92) -> str:
+        """Compact, deterministic preview; the complete text stays expandable."""
+        value = " ".join(value.split())
+        if len(value) <= limit:
+            return value
+        for stop in ("。", "；"):
+            cut = value.find(stop)
+            if 24 <= cut < limit:
+                return value[:cut + 1]
+        return value[:limit].rstrip("，；。 ") + "…"
     platform_cards = []
+    # v1 compatibility: keep displaying the last successful legacy payload.
     for item in insight.get("platforms", []):
-        if not isinstance(item, dict):
-            continue
-        analysis = item.get("analysis")
-        content = f'<p>{esc(analysis)}</p>' if isinstance(analysis, str) else f'<ul>{bullets(item.get("bullets", []))}</ul>'
-        platform_cards.append(f'<article class="ai-platform"><h4>{esc(item.get("name"))}</h4>{content}</article>')
+        if isinstance(item, dict):
+            analysis = item.get("analysis")
+            content = f'<p>{esc(analysis)}</p>' if isinstance(analysis, str) else f'<ul>{bullets(item.get("bullets", []))}</ul>'
+            platform_cards.append(f'<article class="ai-platform"><h4>{esc(item.get("name"))}</h4>{content}</article>')
+    v2 = isinstance(insight.get("core_insights"), list)
     window = payload.get("window", {})
+    core_insights = [item for item in insight.get("core_insights", []) if isinstance(item, str)]
+    compact_insights = "".join(
+        f'''<details class="ai-insight-item">
+          <summary><span class="ai-insight-index">{index:02d}</span><span class="ai-insight-preview">{esc(preview(item))}</span><span class="ai-expand-label">展开</span></summary>
+          <p class="ai-insight-detail">{esc(item)}</p>
+        </details>'''
+        for index, item in enumerate(core_insights, 1)
+    )
     return f"""
       <div class="ai-insight-head">
         <div><span class="ai-label">CURSOR AGENT · WEEKLY WINSIGHT</span>
           <h3>{esc(insight.get("headline"))}</h3></div>
-        <div class="ai-period">数据窗口 {esc(window.get("start"))} — {esc(window.get("end"))}<br>生成于 {esc(payload.get("generated_at"))}</div>
+        <div class="ai-period"><span>数据窗口 {esc(window.get("start"))} — {esc(window.get("end"))}</span><span title="{esc(payload.get('generated_at'))}">已生成</span></div>
       </div>
-      {f'<div class="ai-summary"><ul>{bullets(insight.get("summary", []))}</ul></div>' if insight.get('summary') else ''}
+      {f'<div class="ai-summary ai-brief-grid">{compact_insights}</div>' if v2 else (f'<div class="ai-summary"><ul>{bullets(insight.get("summary", []))}</ul></div>' if insight.get('summary') else '')}
       {f'<div class="ai-platform-grid">{"".join(platform_cards)}</div>' if platform_cards else ''}
-      {f'<div class="ai-caveat"><strong>口径提示</strong> {esc(insight.get("caveat"))}</div>' if insight.get('caveat') else ''}
+      {f'<details class="ai-more"><summary><span>Zoomex 对照与下周关注</span><span class="ai-more-meta">{len(insight.get("next_week", []))} 项待验证</span></summary><div class="ai-foot-grid"><section><h4>Zoomex 对照</h4><p>{esc(insight.get("zoomex_comparison"))}</p></section><section><h4>下周关注</h4><ul>{bullets(insight.get("next_week", []))}</ul></section></div></details>' if v2 else ''}
+      {'<div class="ai-caveat"><strong>历史版本提示</strong> 此结果由旧版结构生成；页面统一按首采快照口径理解，下一次成功生成后将自动升级为新版结构。</div>' if not v2 else ''}
+      {f'<details class="ai-caveat"><summary>数据覆盖与口径提示</summary><p>{esc(insight.get("caveat"))}</p></details>' if v2 and insight.get('caveat') else (f'<div class="ai-caveat"><strong>口径提示</strong> {esc(insight.get("caveat"))}</div>' if insight.get('caveat') else '')}
     """
+
+
+def _volume_guide_html() -> str:
+    """Volume-only metric dictionary, kept next to the deterministic rules."""
+    topic_meanings = {
+        "Activity": "活动、竞赛、空投、奖励或赠金类内容",
+        "Product": "产品、App、平台功能、合约、现货或跟单功能",
+        "Tutorial": "教程、指南、注册、充值、提现或操作步骤",
+        "Market Analysis": "行情、价格、技术分析、预测或市场展望",
+        "Trading Signal": "入场、做多/做空、止盈、止损或交易信号",
+        "Review/Comparison": "评测、对比、VS、优缺点或平台比较",
+        "Listing": "上币、新币、新交易对或 Launchpool",
+        "Brand Introduction": "品牌介绍、平台概览或“是什么”类内容",
+    }
+    topic_cards = []
+    for topic, meaning in topic_meanings.items():
+        examples = " / ".join(CONTENT_TOPIC_KEYWORDS.get(topic, ())[:4])
+        topic_cards.append(
+            f'<article class="guide-term"><h4><code>{html.escape(topic)}</code></h4>'
+            f'<p>{meaning}。示例触发词：{html.escape(examples)}。</p></article>'
+        )
+    topic_cards.append(
+        '<article class="guide-term"><h4><code>Other</code></h4>'
+        '<p>标题、Description 和 Hashtag 都未命中已配置主题关键词。</p></article>'
+    )
+    return f"""
+<div class="guide-backdrop" id="volGuideBackdrop" aria-hidden="true"></div>
+<aside class="guide-drawer" id="volGuideDrawer" role="dialog" aria-modal="true" aria-labelledby="volGuideTitle" aria-hidden="true">
+  <div class="guide-head">
+    <div><span class="ai-label">VOLUME METRIC DICTIONARY</span><h2 id="volGuideTitle">口径说明</h2><p>理解竞品推广规模、账号结构、内容分类与首采信号。</p></div>
+    <button type="button" class="guide-close" id="volGuideClose" aria-label="关闭使用指南">关闭</button>
+  </div>
+  <div class="guide-search"><label for="volGuideSearch">搜索指标或口径</label><input type="search" id="volGuideSearch" placeholder="例如：独立账号、brand_led、早期高表现" autocomplete="off"></div>
+  <div class="guide-body" id="volGuideBody">
+    <details class="guide-group" open><summary>核心计数与窗口</summary><div class="guide-terms">
+      <article class="guide-term"><h4>推广记录数</h4><p>数据库中命中的推广链接记录数。同一视频可因多个链接产生多条记录，不用于竞品规模比较。</p></article>
+      <article class="guide-term"><h4>推广视频数</h4><p>按 <code>competitor × video_url</code> 去重。同一视频推广多个竞品时，会分别计入对应竞品。</p></article>
+      <article class="guide-term"><h4>Promotion Share</h4><p>某竞品去重推广视频数 ÷ 五个核心竞品视频数之和。仅表示当前系统覆盖范围，不是全网声量份额。</p></article>
+      <article class="guide-term"><h4>GR / 前期</h4><p>GR（Growth Rate）为指定期间相对紧邻上一同长期间的视频数增长率。前期为 0 时不计算百分比，当前有量则显示 NEW。只有变化率绝对值≥{WOW_HIGHLIGHT_PERCENT}%，且视频数绝对变化≥{WOW_HIGHLIGHT_ABS_CHANGE}，才显著高亮。</p></article>
+    </div></details>
+
+    <details class="guide-group" open><summary>竞品矩阵与账号结构</summary><div class="guide-terms">
+      <article class="guide-term"><h4>独立账号</h4><p>当前窗口内推广该竞品的去重 YouTube 账号数。优先用 Channel ID 去重，缺失时才使用账号名。</p></article>
+      <article class="guide-term"><h4>“连续”与“均”</h4><p><strong>连续</strong>：指定期间和上一同长期间都推广该竞品的账号数。<strong>均</strong>：去重推广视频数 ÷ 独立账号数，即每个账号平均推广视频数。</p></article>
+      <article class="guide-term"><h4>Top1 / Top3</h4><p>发布量最高的 1 个 / 3 个账号，其去重推广视频占该竞品视频总数的比例。</p></article>
+      <article class="guide-term"><h4>账号集中信号</h4><p>样本&lt;3 为“样本不足”；Top1≥60% 为“高度集中”；40%–60% 为“相对集中”；低于40% 为“相对分散”。</p></article>
+    </div></details>
+
+    <details class="guide-group"><summary>推广方式判定</summary><div class="guide-intro">推广方式是可多选的规则标签，由标题、推广链接命中、同视频平台数和明确配置的官方频道共同决定。</div><div class="guide-terms">
+      <article class="guide-term"><h4><code>brand_led</code></h4><p>竞品名称在视频标题中作为独立词命中，视为品牌导向内容。</p></article>
+      <article class="guide-term"><h4><code>description_only</code></h4><p>推广链接命中了该竞品，但竞品名未出现在标题中。不因 Description 里有链接就判为独立品牌内容。</p></article>
+      <article class="guide-term"><h4><code>multi_platform</code></h4><p>同一 YouTube 视频同时命中两个或以上交易平台的推广链接。</p></article>
+      <article class="guide-term"><h4><code>unclassified</code></h4><p>兼容性保留标签。</p></article>
+    </div></details>
+
+    <details class="guide-group"><summary>内容主题判定</summary><div class="guide-intro">对标题 + Description + Hashtag 进行不区分大小写的关键词匹配。一条视频可同时命中多个主题；在视频明细中点击“查看判定依据”可稳定展示主题命中词。</div><div class="guide-terms">{"".join(topic_cards)}</div></details>
+
+    <details class="guide-group"><summary>首采表现与观察时长</summary><div class="guide-terms">
+      <article class="guide-term"><h4>首采播放中位数</h4><p>只使用视频首次被系统识别时保存的播放量，不是最终播放或完整生命周期表现。</p></article>
+      <article class="guide-term"><h4>初始互动率</h4><p><code>(首采点赞 + 首采评论) ÷ 首采播放</code>。播放为 0 或必要字段缺失时显示“—”。</p></article>
+      <article class="guide-term"><h4>观察时长</h4><p>首次抓取时间 − 视频发布时间，分为 0–12h、12–24h、24–36h、36–48h、48h+ 和 Unknown。</p></article>
+      <article class="guide-term"><h4>早期高表现</h4><p>在相同观察时长区间内，首采播放进入核心竞品视频前 20%。每个区间样本至少 {EARLY_PERFORMANCE_MIN_SAMPLE} 条才计算。</p></article>
+    </div></details>
+
+    <details class="guide-group"><summary>结构信号与推断限制</summary><div class="guide-terms">
+      <article class="guide-term"><h4>集中铺量 / 长尾扩张</h4><p>账号高度或相对集中时标记“集中铺量”；账号≥4 且 Top1&lt;40% 时标记“长尾扩张”。</p></article>
+      <article class="guide-term"><h4>为主 / 内容增长</h4><p><code>description_only</code>≥60% 为“Description挂链为主”；<code>multi_platform</code>≥50% 为“Multi-platform为主”；Activity 或 Product 比前窗增加≥3条时标记内容增长。</p></article>
+
+    </div></details>
+    <div class="guide-empty" id="volGuideEmpty" hidden>未找到匹配的指标或口径。</div>
+  </div>
+</aside>
+"""
 
 
 def _remove_between(
@@ -237,7 +337,7 @@ def _prune_generated_page(html_text: str, page_mode: str) -> str:
             html_text, "  <!-- ── Tab: 竞品声量", "\n</div>\n\n<script>"
         )
         html_text = _remove_between(
-            html_text, "// ── 竞品声量 tab", "renderVolume();", include_end=True, last_end=True
+            html_text, "// ── 竞品声量 tab", "renderVolumeV2();", include_end=True, last_end=True
         )
         return html_text
 
@@ -252,7 +352,7 @@ def _prune_generated_page(html_text: str, page_mode: str) -> str:
             html_text, "// ── Latest tab", "// ── 竞品声量 tab"
         )
         html_text = _remove_between(
-            html_text, "// ── 竞品声量 tab", "renderVolume();", include_end=True, last_end=True
+            html_text, "// ── 竞品声量 tab", "renderVolumeV2();", include_end=True, last_end=True
         )
         return html_text
 
@@ -269,6 +369,9 @@ def _prune_generated_page(html_text: str, page_mode: str) -> str:
     html_text = _remove_between(
         html_text, "// ── Latest tab", "// ── 竞品声量 tab"
     )
+    html_text = _remove_between(
+        html_text, "// ── 竞品声量 tab", "renderVolume();", include_end=True, last_end=True
+    )
     return html_text
 
 
@@ -277,9 +380,17 @@ def generate_html(
     weekly_insight: dict | None = None, page_mode: str = "main",
 ) -> str:
     colors_js         = json.dumps(CHART_COLORS)
-    all_js            = json.dumps([] if page_mode == "channels" else _row_dicts(leads), ensure_ascii=False)
+    # Standalone pages must not embed unrelated datasets. Volume is computed
+    # server-side into VOLUME_DATA and never needs the raw all-platform leads or
+    # channel table payload in the browser.
+    all_js            = json.dumps(_row_dicts(leads) if page_mode == "main" else [], ensure_ascii=False)
     channels_js       = json.dumps(
-        [] if page_mode == "main" else _channel_row_dicts(channels), ensure_ascii=False
+        _channel_row_dicts(channels) if page_mode == "channels" else [], ensure_ascii=False
+    )
+    volume_facts = build_video_facts(leads, channels, CORE_COMPETITOR_PLATFORMS) if page_mode == "volume" else []
+    volume_payload_js = json.dumps(
+        build_report_payload(volume_facts, CORE_COMPETITOR_PLATFORMS) if volume_facts else {"facts": [], "windows": {}},
+        ensure_ascii=False,
     )
     core_platforms_js = json.dumps(CORE_COMPETITOR_PLATFORMS, ensure_ascii=False)
     insight_html      = _insight_html(weekly_insight or {})
@@ -287,7 +398,7 @@ def generate_html(
     volume_page = page_mode == "volume"
     page_title = (
         "PromoLeads · 频道视图" if channels_page
-        else "PromoLeads · 竞品声量" if volume_page
+        else "PromoLeads · 竞品 YouTube 推广表现" if volume_page
         else "PromoLeads 看板"
     )
     if channels_page or volume_page:
@@ -302,6 +413,12 @@ def generate_html(
     if volume_page:
         latest_active = ""
     volume_active = " active" if volume_page else ""
+    guide_button_html = (
+        '<button type="button" class="guide-open" id="volGuideOpen" '
+        'aria-controls="volGuideDrawer" aria-expanded="false">口径说明</button>'
+        if volume_page else ""
+    )
+    guide_drawer_html = _volume_guide_html() if volume_page else ""
 
     html_output = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -314,19 +431,19 @@ def generate_html(
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 <style>
 :root {{
-  --bg:#070C18; --surface:#0C1526; --card:#0F1A2E; --card-h:#132038;
-  --border:rgba(34,211,238,0.1); --border-h:rgba(34,211,238,0.35);
-  --blue:#3B82F6; --cyan:#22D3EE; --amber:#F59E0B; --green:#10B981; --red:#EF4444;
-  --text:#CBD5E1; --text-1:#E2E8F0; --text-2:#475569; --text-dim:#2D3F55;
-  --font-mono:'JetBrains Mono',monospace; --font-sans:'Inter',sans-serif;
-  --radius:10px; --glow-blue:0 0 18px rgba(59,130,246,0.25);
+  --bg:#0C0A0B; --surface:#121011; --card:#171415; --card-h:#1E191B;
+  --border:rgba(255,116,130,.14); --border-h:rgba(255,58,78,0.54);
+  --blue:#7EA6F8; --cyan:#FF4D5E; --amber:#F6BD57; --green:#46C98B; --red:#FF6675;
+  --text:#B8BDC7; --text-1:#F1F2F4; --text-2:#7D8491; --text-dim:#5F6672;
+  --font-mono:'JetBrains Mono',monospace; --font-sans:'Inter','PingFang SC','Noto Sans SC','Microsoft YaHei',sans-serif;
+  --radius:10px; --glow-blue:0 8px 24px rgba(0,0,0,0.28);
 }}
 * {{ box-sizing:border-box; margin:0; padding:0; }}
 body {{
   background:var(--bg); color:var(--text); font-family:var(--font-sans);
   background-image:
-    linear-gradient(rgba(34,211,238,0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(34,211,238,0.03) 1px, transparent 1px);
+    linear-gradient(rgba(255,77,94,0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,77,94,0.022) 1px, transparent 1px);
   background-size:40px 40px;
   min-height:100vh;
 }}
@@ -337,9 +454,41 @@ body {{
 }}
 .topbar .brand {{ font-family:var(--font-mono); font-weight:700; color:var(--text-1); letter-spacing:0.5px; }}
 .topbar .brand span {{ color:var(--cyan); }}
+.topbar-actions {{ display:flex; align-items:center; gap:12px; }}
 .status {{ display:flex; align-items:center; gap:8px; font-family:var(--font-mono); font-size:12px; color:var(--text-2); }}
 .dot {{ width:8px; height:8px; border-radius:50%; background:var(--green); box-shadow:0 0 8px var(--green); animation:pulse 2s infinite; }}
 @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.4; }} }}
+.guide-open,.guide-close {{ min-height:44px; border:1px solid var(--border-h); border-radius:7px; padding:8px 14px; color:var(--text-1); background:rgba(255,0,51,.08); font:600 12px var(--font-sans); cursor:pointer; }}
+.guide-open:hover,.guide-close:hover {{ color:var(--cyan); background:rgba(255,0,51,.15); }}
+.guide-open:focus-visible,.guide-close:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
+.guide-backdrop {{ position:fixed; inset:0; z-index:49; visibility:hidden; opacity:0; pointer-events:none; background:rgba(7,4,5,.72); backdrop-filter:blur(2px); transition:opacity .2s ease,visibility .2s ease; }}
+.guide-backdrop.is-open {{ visibility:visible; opacity:1; pointer-events:auto; }}
+.guide-drawer {{ position:fixed; z-index:50; inset:0 0 0 auto; width:min(560px,100vw); display:flex; flex-direction:column; color:var(--text); background:#111111; border-left:1px solid var(--border-h); box-shadow:-24px 0 64px rgba(0,0,0,.55); transform:translateX(100%); visibility:hidden; transition:transform .24s ease,visibility 0s linear .24s; }}
+.guide-drawer.is-open {{ transform:translateX(0); visibility:visible; transition:transform .24s ease,visibility 0s; }}
+.guide-head {{ flex:0 0 auto; display:flex; justify-content:space-between; align-items:flex-start; gap:20px; padding:22px 24px 18px; border-bottom:1px solid var(--border); background:linear-gradient(135deg,rgba(255,0,51,.16),rgba(255,77,103,.035)); }}
+.guide-head h2 {{ margin:5px 0 4px; color:var(--text-1); font-size:22px; }}
+.guide-head p {{ max-width:42ch; color:#94A3B8; font-size:12px; line-height:1.55; }}
+.guide-close {{ flex:0 0 auto; background:var(--surface); }}
+.guide-search {{ flex:0 0 auto; padding:14px 24px; border-bottom:1px solid var(--border); }}
+.guide-search label {{ display:block; margin-bottom:6px; color:#94A3B8; font:10px var(--font-mono); }}
+.guide-search input {{ width:100%; min-height:44px; border:1px solid var(--border); border-radius:7px; padding:9px 11px; color:var(--text-1); background:var(--surface); font:13px var(--font-sans); }}
+.guide-search input:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
+.guide-body {{ min-height:0; overflow:auto; overscroll-behavior:contain; padding:8px 24px 28px; scroll-padding-top:8px; }}
+.guide-group {{ border-bottom:1px solid var(--border); }}
+.guide-group > summary {{ min-height:52px; display:flex; align-items:center; gap:12px; list-style:none; color:var(--text-1); font-size:14px; font-weight:600; cursor:pointer; }}
+.guide-group > summary::-webkit-details-marker {{ display:none; }}
+.guide-group > summary::after {{ content:''; width:7px; height:7px; margin-left:auto; border-right:1.5px solid #64748B; border-bottom:1.5px solid #64748B; transform:rotate(45deg); transition:transform .2s ease; }}
+.guide-group[open] > summary::after {{ transform:rotate(225deg); }}
+.guide-group > summary:focus-visible {{ outline:2px solid var(--cyan); outline-offset:-2px; }}
+.guide-intro {{ margin:-2px 0 10px; padding:10px 12px; border-radius:7px; color:#A3A3A3; background:rgba(255,0,51,.055); font-size:12px; line-height:1.6; }}
+.guide-terms {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:0 0 14px; }}
+.guide-term {{ padding:11px 12px; border:1px solid rgba(255,255,255,.08); border-radius:7px; background:rgba(0,0,0,.28); }}
+.guide-term h4 {{ margin:0 0 5px; color:var(--text-1); font-size:12px; }}
+.guide-term p {{ color:#A8B5C8; font-size:12px; line-height:1.62; }}
+.guide-term strong {{ color:var(--text-1); }}
+.guide-term code {{ padding:1px 4px; border-radius:4px; color:#FF8A9E; background:rgba(255,0,51,.09); font:10px var(--font-mono); }}
+.guide-empty {{ padding:32px 12px; text-align:center; color:#64748B; font-size:12px; }}
+body.guide-opened {{ overflow:hidden; }}
 
 .tabbar {{
   position:sticky; top:58px; z-index:19; display:flex; gap:4px; padding:0 24px;
@@ -363,9 +512,13 @@ body {{
   background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
   padding:18px 20px; transition:all 0.2s;
 }}
-.kpi-card:hover {{ border-color:var(--border-h); box-shadow:var(--glow-blue); }}
+.kpi-card:hover {{ border-color:rgba(255,116,130,.30); box-shadow:var(--glow-blue); }}
 .kpi-label {{ font-size:12px; color:var(--text-2); text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }}
-.kpi-value {{ font-family:var(--font-mono); font-size:26px; font-weight:700; color:var(--text-1); text-shadow:0 0 12px rgba(34,211,238,0.2); }}
+.kpi-value {{ font-family:var(--font-mono); font-size:26px; font-weight:700; color:#D9DCE2; }}
+.kpi-card-primary {{ border-color:rgba(255,77,94,.30); background:linear-gradient(135deg,rgba(255,77,94,.10),var(--card) 62%); }}
+.kpi-card-primary .kpi-value {{ color:#FF7180; }}
+.kpi-card-accent .kpi-value {{ color:var(--text-1); }}
+.kpi-card-accent {{ box-shadow:inset 0 2px 0 rgba(255,77,94,.30); }}
 
 .chip-row {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:24px; }}
 .chip {{
@@ -401,7 +554,7 @@ body {{
   color:#94A3B8; padding:7px 10px; cursor:pointer; font:600 12px var(--font-mono); transition:all .15s;
 }}
 .quick-filter-btn:hover {{ color:var(--text-1); border-color:var(--border-h); }}
-.quick-filter-btn.active {{ color:var(--cyan); border-color:var(--cyan); background:rgba(34,211,238,.12); }}
+.quick-filter-btn.active {{ color:#FFF; border-color:var(--cyan); background:rgba(255,0,51,.18); }}
 .quick-filter-btn:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
 .filter-bar input:focus {{ border-color:var(--border-h); }}
 .filter-bar button {{
@@ -439,11 +592,11 @@ td a {{ color:var(--blue); text-decoration:none; }}
 td a:hover {{ color:var(--cyan); text-decoration:underline; }}
 .badge {{
   display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px; margin:1px 3px 1px 0;
-  font-family:var(--font-mono); background:rgba(59,130,246,0.12); color:var(--blue);
-  border:1px solid rgba(59,130,246,0.25);
+  font-family:var(--font-mono); background:rgba(255,0,51,0.11); color:#FF8A9E;
+  border:1px solid rgba(255,0,51,0.24);
 }}
 .video-row {{ cursor:pointer; }}
-.video-row:hover {{ background:rgba(34,211,238,0.05); }}
+.video-row:hover {{ background:rgba(255,0,51,0.055); }}
 .expand-toggle {{ color:var(--cyan); font-family:var(--font-mono); font-size:12px; white-space:nowrap; }}
 
 /* Compact compound cells (频道视图): two-line stacked value, keeps every number
@@ -462,10 +615,10 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
 .contact-pills {{ display:flex; flex-wrap:wrap; gap:4px; }}
 .contact-pill {{
   display:inline-flex; align-items:center; gap:3px; padding:2px 8px; border-radius:10px;
-  font-size:11px; font-family:var(--font-mono); background:rgba(34,211,238,0.08);
+  font-size:11px; font-family:var(--font-mono); background:rgba(255,0,51,0.08);
   color:var(--cyan); border:1px solid var(--border); text-decoration:none; white-space:nowrap;
 }}
-.contact-pill:hover {{ background:rgba(34,211,238,0.16); border-color:var(--border-h); color:var(--cyan); }}
+.contact-pill:hover {{ background:rgba(255,0,51,0.16); border-color:var(--border-h); color:var(--cyan); }}
 
 /* 竞品声量 tab: togglable platform chips, WoW deltas, clickable volume cells */
 .platform-chip {{
@@ -474,10 +627,10 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
   cursor:pointer; user-select:none; transition:all 0.15s;
 }}
 .platform-chip:hover {{ border-color:var(--border-h); color:var(--text-1); }}
-.platform-chip.active {{ background:rgba(34,211,238,0.12); border-color:var(--border-h); color:var(--cyan); }}
+.platform-chip.active {{ background:rgba(255,0,51,0.14); border-color:var(--border-h); color:#FF8A9E; }}
 .vol-cell {{ cursor:pointer; font-family:var(--font-mono); }}
 .vol-cell:hover {{ color:var(--cyan); text-decoration:underline; }}
-.vol-cell.selected {{ background:rgba(34,211,238,0.08); border-radius:4px; }}
+.vol-cell.selected {{ background:rgba(255,0,51,0.09); border-radius:4px; }}
 .wow-up {{ color:var(--green); }}
 .wow-down {{ color:var(--red); }}
 .wow-flag {{ font-weight:700; }}
@@ -487,27 +640,120 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
   font-family:var(--font-mono); background:rgba(239,68,68,0.12); color:var(--red);
   border:1px solid rgba(239,68,68,0.25);
 }}
+.volume-hero {{ display:flex; justify-content:space-between; align-items:flex-start; gap:28px; margin:4px 0 22px; padding:8px 2px; }}
+.volume-hero h1 {{ color:var(--text-1); font-size:30px; line-height:1.2; margin:7px 0 10px; }}
+.volume-hero p {{ max-width:900px; color:#94A3B8; line-height:1.65; font-size:14px; }}
+.eyebrow {{ color:var(--cyan); font:600 11px var(--font-mono); letter-spacing:1.4px; }}
+.scope-badge {{ flex:0 0 auto; border:1px solid var(--border-h); color:#FF8A9E; background:rgba(255,0,51,.09); border-radius:999px; padding:8px 12px; font:11px var(--font-mono); }}
+.compact-card {{ padding-bottom:10px; }}
+.global-filter-card {{ position:relative; border-color:rgba(255,116,130,.22); box-shadow:0 12px 32px rgba(0,0,0,.32); }}
+.global-filter-grid {{ display:grid; grid-template-columns:repeat(6,minmax(120px,1fr)); gap:10px; }}
+.global-filter-grid label {{ display:flex; flex-direction:column; gap:6px; color:#94A3B8; font:11px var(--font-mono); }}
+.global-filter-grid select,.global-filter-grid input {{ width:100%; min-height:44px; background:var(--surface); border:1px solid var(--border); border-radius:7px; padding:9px 10px; color:var(--text-1); font:13px var(--font-sans); }}
+.global-filter-grid select:focus-visible,.global-filter-grid input:focus-visible,.filter-reset:focus-visible,.platform-chip:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
+.filter-search-wide {{ grid-column:span 2; }}
+.filter-reset {{ min-height:44px; padding:8px 14px; border-radius:7px; border:1px solid var(--border); color:#CBD5E1; background:var(--surface); cursor:pointer; }}
+.filter-reset:hover {{ border-color:var(--border-h); color:var(--cyan); }}
+.filter-platform-row {{ display:flex; align-items:flex-start; gap:14px; margin-top:14px; }}
+.filter-platform-row > span {{ padding-top:12px; color:#94A3B8; font:11px var(--font-mono); }}
+.filter-platform-row .chip-row {{ margin-bottom:0; }}
+.filter-summary {{ display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-top:10px; }}
+.section-head {{ display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:14px; }}
+.section-head h3 {{ margin-bottom:0; }}
+.hint-inline,.kpi-sub {{ color:#64748B; font:11px/1.5 var(--font-mono); }}
+.chart-filter-context {{ max-width:68%; color:#FF8A9E; font:10px/1.5 var(--font-mono); text-align:right; }}
+.kpi-sub {{ margin-top:8px; }}
+.kpi-text {{ font-size:20px; }}
+.platform-chip {{ min-height:44px; }}
+.matrix-row {{ cursor:pointer; }}
+.matrix-row:hover {{ background:rgba(255,255,255,.025); }}
+.matrix-row:focus-visible {{ outline:2px solid var(--cyan); outline-offset:-2px; }}
+.signal-list {{ display:flex; flex-wrap:wrap; gap:4px; }}
+.signal-pill {{ display:inline-flex; padding:2px 7px; border-radius:999px; border:1px solid var(--border); color:#94A3B8; font:10px var(--font-mono); }}
+.method-pill {{ color:#FF8A9E; }}
+.gr-significant {{ font-weight:700; color:var(--green); background:rgba(16,185,129,.08); }}
+.gr-significant.negative {{ color:#FCA5A5; background:rgba(239,68,68,.08); }}
+#volMatrix tbody td {{ color:#A4AAB5; }}
+#volMatrix tbody td:first-child strong {{ color:var(--text-1); }}
+#volMatrix .matrix-value {{ color:#D9DCE2; font:600 13px var(--font-mono); }}
+#volMatrix td.metric-leader {{ background:linear-gradient(135deg,rgba(255,77,94,.075),rgba(255,77,94,.015)); }}
+#volMatrix td.metric-leader .matrix-value {{ color:#FF7A88; }}
+#volMatrix td.gr-significant {{ color:var(--green); }}
+#volMatrix td.gr-significant.negative {{ color:#FF8A96; }}
+#volTableBody tr:not(:first-child) td {{ color:#8D939E; }}
+#volTableBody tr:first-child td {{ color:#E3E5E9; background:rgba(255,77,94,.045); }}
+#volTableBody tr:first-child td:first-child {{ box-shadow:inset 3px 0 0 var(--cyan); }}
+.heatmap-wrap {{ max-width:100%; overflow:auto; scrollbar-gutter:stable; }}
+.heatmap {{ display:grid; gap:3px; min-width:560px; font:11px var(--font-mono); }}
+.heatmap > div {{ min-height:34px; display:flex; align-items:center; justify-content:center; border:1px solid rgba(148,163,184,.08); border-radius:4px; padding:5px; color:var(--text-1); }}
+.heatmap .heat-label {{ justify-content:flex-start; color:#94A3B8; background:transparent !important; border-color:transparent; }}
+.heatmap .heat-col-label {{ min-height:52px; color:#94A3B8; background:transparent; border-color:transparent; text-align:center; line-height:1.35; white-space:normal; overflow-wrap:anywhere; word-break:normal; }}
+.detail-table {{ width:100%; margin-top:10px; }}
+.detail-table td {{ white-space:normal; vertical-align:top; }}
+.detail-title-link {{ min-height:44px; display:inline-flex; align-items:flex-start; color:var(--text-1); text-decoration:none; line-height:1.5; }}
+.detail-title-link:hover {{ color:var(--cyan); text-decoration:underline; text-underline-offset:3px; }}
+.detail-title-link:focus-visible {{ border-radius:3px; outline:2px solid var(--cyan); outline-offset:3px; }}
+.detail-title-link.is-missing {{ color:#94A3B8; font-style:italic; }}
+.detail-tags {{ display:flex; flex-wrap:wrap; gap:4px; min-width:150px; }}
+.tag-evidence {{ margin-top:7px; min-width:230px; border-top:1px solid var(--border); }}
+.tag-evidence > summary {{ min-height:44px; display:flex; align-items:center; gap:8px; list-style:none; color:#FF8A9E; font:500 11px var(--font-mono); cursor:pointer; }}
+.tag-evidence > summary::-webkit-details-marker {{ display:none; }}
+.tag-evidence > summary::before {{ content:''; width:6px; height:6px; flex:0 0 auto; border-right:1.5px solid currentColor; border-bottom:1.5px solid currentColor; transform:rotate(-45deg); transition:transform .2s ease; }}
+.tag-evidence[open] > summary::before {{ transform:rotate(45deg); }}
+.tag-evidence > summary:hover {{ color:var(--cyan); }}
+.tag-evidence > summary:focus-visible {{ outline:2px solid var(--cyan); outline-offset:-2px; }}
+.tag-evidence-body {{ display:grid; gap:9px; padding:0 0 10px 14px; }}
+.tag-evidence-group {{ display:grid; gap:5px; }}
+.tag-evidence-group > b {{ color:#94A3B8; font:600 10px var(--font-mono); }}
+.tag-evidence-item {{ display:grid; grid-template-columns:auto minmax(0,1fr); gap:7px; align-items:start; color:#94A3B8; font-size:11px; line-height:1.55; }}
+.tag-evidence-item code {{ padding:1px 4px; border-radius:4px; color:#FF8A9E; background:rgba(255,0,51,.08); font:9px/1.5 var(--font-mono); }}
 .ai-insight {{
-  position:relative; overflow:hidden; padding:24px;
-  background:linear-gradient(135deg,rgba(59,130,246,.13),rgba(34,211,238,.04) 48%,var(--card));
-  border-color:rgba(34,211,238,.28);
+  position:relative; overflow:hidden; padding:18px 20px;
+  background:linear-gradient(135deg,rgba(255,77,94,.075),rgba(255,77,94,.018) 48%,var(--card));
+  border-color:rgba(255,116,130,.20);
 }}
 .ai-insight::before {{ content:''; position:absolute; inset:0 auto 0 0; width:3px; background:var(--cyan); }}
-.ai-insight-head {{ display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:18px; }}
-.ai-insight-head h3 {{ font-size:20px; line-height:1.45; margin:7px 0 0; max-width:900px; }}
+.ai-insight-head {{ display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:12px; }}
+.ai-insight-head > div:first-child {{ min-width:0; }}
+.ai-insight-head h3 {{ font-size:18px; font-weight:600; line-height:1.5; margin:5px 0 0; max-width:980px; letter-spacing:-.01em; }}
 .ai-label {{ font:600 11px var(--font-mono); letter-spacing:1.2px; color:var(--cyan); }}
-.ai-period {{ flex:0 0 auto; text-align:right; font:11px/1.7 var(--font-mono); color:#94A3B8; }}
-.ai-summary {{ padding:16px 18px; border:1px solid var(--border); border-radius:8px; background:rgba(7,12,24,.45); }}
+.ai-period {{ flex:0 0 auto; display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; font:10px/1.4 var(--font-mono); color:#938C90; }}
+.ai-period span {{ padding:5px 8px; border:1px solid var(--border); border-radius:999px; background:rgba(12,8,9,.48); }}
+.ai-summary {{ border:1px solid var(--border); border-radius:8px; background:rgba(12,8,9,.42); }}
 .ai-insight ul {{ padding-left:18px; display:grid; gap:8px; }}
 .ai-insight li {{ line-height:1.65; color:var(--text); }}
+.ai-brief-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:1px; overflow:hidden; }}
+.ai-insight-item {{ min-width:0; background:rgba(20,15,17,.64); }}
+.ai-insight-item + .ai-insight-item {{ border-left:1px solid var(--border); }}
+.ai-insight-item[open] {{ grid-column:1/-1; border-left:0; border-top:1px solid var(--border); background:rgba(25,18,20,.90); }}
+.ai-insight-item summary,.ai-more summary,.ai-caveat summary {{ list-style:none; cursor:pointer; user-select:none; }}
+.ai-insight-item summary::-webkit-details-marker,.ai-more summary::-webkit-details-marker,.ai-caveat summary::-webkit-details-marker {{ display:none; }}
+.ai-insight-item summary {{ min-height:76px; display:grid; grid-template-columns:auto 1fr auto; align-items:start; gap:10px; padding:13px 14px; }}
+.ai-insight-item summary:hover {{ background:rgba(255,0,51,.045); }}
+.ai-insight-item summary:focus-visible,.ai-more summary:focus-visible,.ai-caveat summary:focus-visible {{ outline:2px solid var(--cyan); outline-offset:-2px; }}
+.ai-insight-index {{ color:var(--cyan); font:600 10px/1.55 var(--font-mono); }}
+.ai-insight-preview {{ display:-webkit-box; overflow:hidden; -webkit-line-clamp:2; -webkit-box-orient:vertical; color:var(--text-1); font-size:13px; line-height:1.55; }}
+.ai-expand-label {{ color:#7F777C; font:10px/1.55 var(--font-mono); }}
+.ai-insight-item[open] .ai-expand-label {{ font-size:0; }}
+.ai-insight-item[open] .ai-expand-label::after {{ content:'收起'; font-size:10px; }}
+.ai-insight-detail {{ max-width:78ch; margin:0 14px 15px 44px; color:#C0BABD; font-size:13px; line-height:1.72; }}
 .ai-platform-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin-top:14px; }}
-.ai-platform {{ padding:16px 18px; background:rgba(12,21,38,.72); border:1px solid var(--border); border-radius:8px; }}
+.ai-platform {{ padding:16px 18px; background:rgba(22,16,18,.78); border:1px solid var(--border); border-radius:8px; }}
 .ai-platform h4,.ai-foot-grid h4 {{ color:var(--text-1); font-size:13px; margin-bottom:10px; }}
 .ai-platform p {{ color:var(--text); line-height:1.75; }}
-.ai-caveat {{ margin-top:14px; padding:12px 16px; color:#94A3B8; font-size:12px; border-top:1px solid var(--border); }}
-.ai-foot-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:14px; }}
-.ai-foot-grid section {{ padding:16px 18px; border-top:1px solid var(--border); }}
-.ai-empty {{ padding:28px; text-align:center; color:#94A3B8; font:12px/1.7 var(--font-mono); }}
+.ai-more {{ margin-top:9px; border-top:1px solid var(--border); }}
+.ai-more > summary {{ min-height:44px; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 10px; color:var(--text-1); font-size:12px; font-weight:600; }}
+.ai-more > summary::after,.ai-caveat > summary::after {{ content:''; width:7px; height:7px; flex:0 0 auto; border-right:1.5px solid #64748B; border-bottom:1.5px solid #64748B; transform:rotate(45deg); transition:transform .2s ease; }}
+.ai-more[open] > summary::after,.ai-caveat[open] > summary::after {{ transform:rotate(225deg); }}
+.ai-more-meta {{ margin-left:auto; color:#7F777C; font:10px var(--font-mono); }}
+.ai-caveat {{ margin-top:2px; color:#9B9498; font-size:11px; border-top:1px solid var(--border); }}
+.ai-caveat > summary {{ min-height:44px; display:flex; align-items:center; gap:10px; padding:8px 10px; font:500 11px var(--font-mono); }}
+.ai-caveat > summary::after {{ margin-left:auto; }}
+.ai-caveat > p {{ max-width:100ch; padding:0 10px 12px; line-height:1.65; }}
+.ai-foot-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:1px; margin-top:0; border-top:1px solid var(--border); background:var(--border); }}
+.ai-foot-grid section {{ padding:14px 16px; background:rgba(25,18,20,.90); }}
+.ai-foot-grid p,.ai-foot-grid li {{ font-size:12px; line-height:1.68; }}
+.ai-empty {{ padding:28px; text-align:center; color:#9B9498; font:12px/1.7 var(--font-mono); }}
 .detail-row td {{ background:var(--surface); padding:14px 20px; white-space:normal; }}
 .detail-list {{ display:flex; flex-direction:column; gap:8px; }}
 .detail-item {{ display:flex; align-items:center; gap:10px; font-size:13px; flex-wrap:wrap; }}
@@ -524,21 +770,44 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
   .chart-grid {{ grid-template-columns:1fr; }}
   .ai-platform-grid,.ai-foot-grid {{ grid-template-columns:1fr; }}
   .ai-insight-head {{ flex-direction:column; }}
-  .ai-period {{ text-align:left; }}
+  .ai-period {{ justify-content:flex-start; }}
+  .global-filter-grid {{ grid-template-columns:repeat(3,minmax(0,1fr)); }}
+  .global-filter-card {{ position:relative; top:auto; }}
 }}
 @media (max-width:600px) {{
   .container {{ padding:12px; }}
   .kpi-grid, .kpi-grid.kpi-grid-5 {{ grid-template-columns:1fr; }}
+  .ai-insight {{ padding:16px; }}
+  .ai-insight-head h3 {{ font-size:16px; }}
+  .ai-brief-grid {{ grid-template-columns:1fr; }}
+  .ai-insight-item + .ai-insight-item {{ border-left:0; border-top:1px solid var(--border); }}
+  .ai-insight-detail {{ margin-left:14px; }}
   .filter-bar {{ align-items:stretch; }}
   .filter-bar label {{ margin-top:4px; }}
+  .volume-hero {{ flex-direction:column; }}
+  .volume-hero h1 {{ font-size:24px; }}
+  .scope-badge {{ align-self:flex-start; }}
+  .global-filter-grid {{ grid-template-columns:1fr 1fr; }}
+  .filter-search-wide {{ grid-column:1 / -1; }}
+  .filter-platform-row {{ flex-direction:column; gap:4px; }}
+  .filter-platform-row > span {{ padding-top:0; }}
+  .topbar {{ padding:0 12px; }}
+  .status {{ display:none; }}
+  .guide-open {{ padding-inline:11px; }}
+  .guide-head,.guide-search {{ padding-left:16px; padding-right:16px; }}
+  .guide-body {{ padding-left:16px; padding-right:16px; }}
+  .guide-terms {{ grid-template-columns:1fr; }}
 }}
+@media (prefers-reduced-motion:reduce) {{ *,*::before,*::after {{ scroll-behavior:auto !important; animation:none !important; transition:none !important; }} }}
 </style>
 </head>
 <body>
 <div class="topbar">
   <div class="brand">PROMO<span>LEADS</span> · 看板</div>
-  <div class="status"><span class="dot"></span>更新于 {run_date}</div>
+  <div class="topbar-actions">{guide_button_html}<div class="status"><span class="dot"></span>更新于 {run_date}</div></div>
 </div>
+
+{guide_drawer_html}
 
 {tabbar_html}
 
@@ -740,79 +1009,95 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
 
   <!-- ── Tab: 竞品声量 ────────────────────────────────────────────────── -->
   <div id="tab-volume" class="tab-content{volume_active}">
+    <header class="volume-hero">
+      <div><span class="eyebrow">COMPETITIVE YOUTUBE PERFORMANCE</span>
+        <h1>竞品 YouTube 推广表现</h1>
+        <p>数据为系统在指定期间内识别到的 YouTube 竞品推广视频。视频表现为发布次日首次抓取时的快照，不代表完整生命周期播放表现。</p>
+      </div>
+      <div class="scope-badge">当前系统覆盖范围 · 首采快照</div>
+    </header>
+
+    <section class="card global-filter-card" aria-label="全局筛选器">
+      <div class="section-head"><h3>全局筛选器</h3><button type="button" class="filter-reset" id="volFilterReset">重置筛选</button></div>
+      <div class="global-filter-grid">
+        <label>快捷期间<select id="volWindowSize" aria-label="快捷期间"><option value="7">最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="custom">自定义</option></select></label>
+        <label>趋势期间数<select id="volWindowCount" aria-label="趋势期间数"><option value="4">4</option><option value="6">6</option><option value="8">8</option></select></label>
+        <label>开始日期<input type="date" id="volDateFrom" aria-label="开始日期"></label>
+        <label>结束日期<input type="date" id="volDateTo" aria-label="结束日期"></label>
+        <label>市场<select id="volMarketFilter" aria-label="市场"><option value="">全部市场</option></select></label>
+        <label>语言<select id="volLanguageFilter" aria-label="语言"><option value="">全部语言</option></select></label>
+        <label>推广方式<select id="volMethodFilter" aria-label="推广方式"><option value="">全部方式</option></select></label>
+        <label>内容主题<select id="volTopicFilter" aria-label="内容主题"><option value="">全部主题</option></select></label>
+        <label class="filter-search-wide">账号 / 标题搜索<input type="search" id="volTextFilter" placeholder="输入账号或标题" autocomplete="off"></label>
+      </div>
+      <div class="filter-platform-row"><span>竞品</span><div class="chip-row" id="volPlatformChips" role="group" aria-label="选择竞品"></div></div>
+      <div class="filter-summary"><span class="table-meta" id="volMeta"></span><span class="table-meta" id="volFilterMeta" aria-live="polite"></span></div>
+    </section>
+
     <section class="card ai-insight" aria-label="每周 AI Winsight">
       {insight_html}
     </section>
 
-    <div class="filter-bar">
-      <label>窗口长度</label>
-      <select id="volWindowSize">
-        <option value="7">7 天</option>
-        <option value="14">14 天</option>
-        <option value="30">30 天</option>
-      </select>
-      <label>对比窗口数</label>
-      <select id="volWindowCount">
-        <option value="4">4</option>
-        <option value="6">6</option>
-        <option value="8">8</option>
-      </select>
-      <span class="table-meta" id="volMeta"></span>
-    </div>
-
-    <div class="card">
-      <h3>对比平台</h3>
-      <div class="chip-row" id="volPlatformChips"></div>
-      <div class="hint">💡 只列出 config.CORE_COMPETITOR_KEYWORDS 里的核心竞品（这几个词享受宽松翻页上限，数据基本完整，其余关键词仍是 1 页/天不适合做时间窗口对比）；默认全选，点击徽标可增减对比对象。声量 = 该窗口内识别到推广链接的视频数，不含评论区提及，口径与旧版周报的社媒监听数据不同</div>
+    <div class="kpi-grid kpi-grid-5" id="volKpis">
+      <div class="kpi-card kpi-card-primary"><div class="kpi-label">核心竞品推广视频</div><div class="kpi-value" id="volKpiVideos">0</div><div class="kpi-sub" id="volKpiWow">—</div></div>
+      <div class="kpi-card kpi-card-accent"><div class="kpi-label">Promotion Share 最高</div><div class="kpi-value kpi-text" id="volKpiShare">—</div><div class="kpi-sub">系统覆盖内推广份额</div></div>
+      <div class="kpi-card"><div class="kpi-label">独立推广账号</div><div class="kpi-value" id="volKpiAccounts">0</div><div class="kpi-sub">跨竞品去重账号</div></div>
+      <div class="kpi-card"><div class="kpi-label">早期高表现视频</div><div class="kpi-value" id="volKpiEarly">0</div><div class="kpi-sub">同观察时长区间前 20%</div></div>
+      <div class="kpi-card kpi-card-accent"><div class="kpi-label">Promotion Share 提升最大</div><div class="kpi-value kpi-text" id="volKpiMomentum">—</div><div class="kpi-sub">较上一同长期间的份额变化</div></div>
     </div>
 
     <div class="table-card">
-      <h3>周度声量对照（按视频发布日期分窗，最新窗口在最上面）</h3>
+      <div class="section-head"><h3>竞品表现矩阵</h3><span class="hint-inline" id="volMatrixPeriod">点击竞品行展开视频明细</span></div>
+      <div class="table-wrap">
+        <table id="volMatrix"><thead><tr>
+          <th>竞品</th><th>推广视频</th><th>Promotion Share</th><th title="Growth Rate：与上一同长期间相比的视频数增长率">GR</th><th>独立账号</th><th>新观察账号</th><th>Top1</th><th>首采播放中位数</th><th>早期高表现</th><th>主要推广方式</th><th>核心主题</th><th>信号</th>
+        </tr></thead><tbody id="volMatrixBody"></tbody></table>
+      </div>
+      <div class="hint">GR =（指定期间视频数 − 上一同长期间视频数）÷ 上一同长期间视频数；前期为 0 时显示 NEW，不计算百分比。仅在 |GR| ≥ 30% 且视频数绝对变化 ≥ 3 时显著高亮。</div>
+    </div>
+
+    <div class="table-card" id="volWindowOverview">
+      <div class="section-head"><h3>分期规模与份额概览</h3><span class="hint-inline">按指定期间长度向前拆分；点击数字展开视频明细</span></div>
       <div class="table-wrap">
         <table id="volTable"><thead><tr id="volTableHead"></tr></thead><tbody id="volTableBody"></tbody></table>
       </div>
-      <div class="hint">💡 |WoW| ≥ 30% 会加粗高亮；点击任意声量数字可在下方展开该窗口/平台的视频明细</div>
     </div>
 
     <div class="chart-grid">
       <div class="card">
-        <h3>视频数量趋势</h3>
+        <h3>去重推广视频趋势</h3>
         <div class="chart-wrap"><canvas id="cVolTrend"></canvas></div>
       </div>
       <div class="card">
-        <h3>视频数量 × 累计播放量（最新窗口）</h3>
-        <div class="chart-wrap"><canvas id="cVolPerformance"></canvas></div>
-        <div class="hint" id="volViewsCoverage"></div>
+        <h3>Promotion Share 趋势</h3>
+        <div class="chart-wrap"><canvas id="cVolShareTrend"></canvas></div>
       </div>
     </div>
 
     <div class="chart-grid">
       <div class="card">
-        <h3>语言构成（当前窗口范围，按平台）</h3>
-        <div class="chart-wrap"><canvas id="cVolLang"></canvas></div>
-        <div class="hint" id="volLangCoverage"></div>
+        <h3>推广规模 × 独立内容结构</h3>
+        <div class="chart-wrap"><canvas id="cVolBrandBubble" aria-label="推广视频数与品牌导向占比气泡图"></canvas></div>
+        <div class="hint">X：去重推广视频数 · Y：brand_led 占比 · Size：独立账号数<br><span id="volBrandBubbleScale"></span></div>
       </div>
       <div class="card">
-        <h3>Top 15 Hashtag（当前窗口范围，视频标题）</h3>
-        <div class="chart-wrap"><canvas id="cVolHashtag"></canvas></div>
-        <div class="hint" id="volHashtagCoverage"></div>
+        <h3>推广规模 × 早期观看信号</h3>
+        <div class="chart-wrap"><canvas id="cVolViewBubble" aria-label="推广视频数与首采播放量中位数气泡图"></canvas></div>
+        <div class="hint">X：去重推广视频数 · Y：首采播放量中位数 · Size：独立账号数<br><span id="volViewBubbleScale"></span> · 首采播放仅作为早期观看信号。</div>
       </div>
     </div>
 
-    <div class="table-card">
-      <h3>账号集中度（最新窗口）</h3>
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th>平台</th><th>视频数</th><th>已覆盖视频播放量</th><th>涉及账号数</th><th>Top1 账号</th><th>Top1 占比</th><th>标题重复度</th>
-          </tr></thead>
-          <tbody id="volConcentrationBody"></tbody>
-        </table>
-      </div>
-      <div class="hint">💡 Top1 占比越高，说明声量越集中于单一账号，"KOL 矩阵"可能只是个例账号在批量挂标签，持续性存疑；标题重复度低（去重数远小于视频数）是同一批模板化标题刷量的另一个信号——建议点开下方明细核实内容形式</div>
+    <div class="chart-grid">
+      <div class="card"><div class="section-head"><h3>竞品 × 内容主题</h3><span class="chart-filter-context" id="volTopicContext"></span></div><div class="heatmap-wrap" id="volTopicHeatmap"></div><div class="hint">一条视频可命中多个主题；选择主题后仅展示该主题在筛选后样本中的数量。</div></div>
+      <div class="card"><div class="section-head"><h3>竞品 × 推广方式结构</h3><span class="chart-filter-context" id="volMethodContext"></span></div><div class="chart-wrap"><canvas id="cVolMethods"></canvas></div><div class="hint">brand_led 与 description_only 用于区分独立品牌导向和 Description 挂链；选择推广方式后仅展示该方式。</div></div>
     </div>
 
-    <div id="volDrillPanel" class="yt-detail-panel"></div>
+    <div class="chart-grid">
+      <div class="card"><div class="section-head"><h3>竞品 × 语言 / 市场</h3><span class="chart-filter-context" id="volMarketContext"></span></div><div class="heatmap-wrap" id="volMarketHeatmap"></div><div class="hint">语言推断不等于真实用户市场；市场优先使用频道国家信息。选择市场或语言后仅展示对应维度。</div></div>
+      <div class="card"><div class="section-head"><h3>账号结构对比</h3><span class="chart-filter-context" id="volAccountContext"></span></div><div class="chart-wrap"><canvas id="cVolAccounts"></canvas></div><div class="hint">展示当前筛选样本的 Top1 / Top3 集中度，以及新观察与连续推广账号。</div></div>
+    </div>
+
+    <div id="volDrillPanel" class="yt-detail-panel" tabindex="-1"></div>
   </div>
 
 </div>
@@ -821,6 +1106,7 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
 const COLORS = {colors_js};
 const ALL_LEADS = {all_js};
 const ALL_CHANNELS = {channels_js};
+const VOLUME_DATA = {volume_payload_js};
 const CORE_COMPETITOR_PLATFORMS = {core_platforms_js};
 const PAGE_MODE = {json.dumps(page_mode)};
 
@@ -1254,7 +1540,7 @@ const channelMarketChart = new Chart(document.getElementById('cChMarketPortfolio
 }});
 
 const channelQualityChart = new Chart(document.getElementById('cChQuality'), {{
-  type: 'scatter', data: {{ datasets: [{{ label: '频道', data: [], pointRadius: 4, pointHoverRadius: 7 }}] }},
+  type: 'scatter', data: {{ datasets: [{{ label: '频道', data: [], pointRadius: 4, pointHoverRadius: 7, borderWidth: 0, hoverBorderWidth: 0 }}] }},
   options: {{ responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ display: false }}, tooltip: {{ callbacks: {{ label: ctx => {{
       const r = ctx.raw; return `${{r.name}} · ${{r.market}}：${{compactNum(r.x)}} 粉丝 · ${{compactNum(r.y)}} 观看`;
@@ -1298,7 +1584,7 @@ function refreshChannels() {{
   const aggs = Array.from(marketAgg.values());
   const maxFollowers = Math.max(1, ...aggs.map(x => x.followers));
   channelMarketChart.data.datasets = aggs.map(a => ({{
-    label: a.market, backgroundColor: marketColor.get(a.market) || COLORS[0], borderColor: 'rgba(255,255,255,.35)', borderWidth: 1,
+    label: a.market, backgroundColor: marketColor.get(a.market) || COLORS[0], borderWidth: 0, hoverBorderWidth: 0,
     data: [{{ x: a.channels, y: a.views, r: 5 + Math.sqrt(a.followers / maxFollowers) * 20, market: a.market, followers: a.followers }}],
   }}));
   channelMarketChart.update();
@@ -1327,11 +1613,23 @@ document.querySelectorAll('#chMarketQuickFilters .quick-filter-btn').forEach(btn
   marketSelect.value = marketSelect.value === btn.dataset.market ? '' : btn.dataset.market;
   refreshChannels();
 }}));
+const LATEST_CHANNEL_UPDATE_DATE = ALL_CHANNELS.reduce(
+  (latest, channel) => channel.last_crawled_date > latest ? channel.last_crawled_date : latest,
+  '',
+);
+function resetChannelFiltersToDefaults() {{
+  ['chMarketFilter', 'chFollowerFilter', 'chMinViews', 'search-channels'].forEach(
+    id => document.getElementById(id).value = '',
+  );
+  document.getElementById('chDateField').value = 'last_crawled_date';
+  document.getElementById('chDateFrom').value = LATEST_CHANNEL_UPDATE_DATE;
+  document.getElementById('chDateTo').value = LATEST_CHANNEL_UPDATE_DATE;
+}}
 document.getElementById('chResetFilters').addEventListener('click', () => {{
-  ['chMarketFilter', 'chFollowerFilter', 'chMinViews', 'chDateFrom', 'chDateTo', 'search-channels'].forEach(id => document.getElementById(id).value = '');
-  document.getElementById('chDateField').value = 'latest_promo_date';
+  resetChannelFiltersToDefaults();
   refreshChannels();
 }});
+resetChannelFiltersToDefaults();
 refreshChannels();
 
 // ── Latest tab: static snapshot of the most recent crawl date ────────────
@@ -1361,7 +1659,7 @@ const latestTable = createVideoTableController({{
 // ── Global tab: charts + date-filtered recompute ─────────────────────────
 const trendChart = new Chart(document.getElementById('cTrend'), {{
   type: 'line',
-  data: {{ labels: [], datasets: [{{ label: '新增推广视频', data: [], borderColor: COLORS[1], backgroundColor: 'rgba(34,211,238,0.12)', fill: true, tension: 0.3, pointRadius: 2 }}] }},
+  data: {{ labels: [], datasets: [{{ label: '新增推广视频', data: [], borderColor: COLORS[1], backgroundColor: 'rgba(255,0,51,0.12)', fill: true, tension: 0.3, pointRadius: 2 }}] }},
   options: {{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ display: false }} }},
@@ -1374,7 +1672,7 @@ const trendChart = new Chart(document.getElementById('cTrend'), {{
 
 const platformByVideoChart = new Chart(document.getElementById('cPlatformByVideo'), {{
   type: 'pie',
-  data: {{ labels: [], datasets: [{{ data: [], backgroundColor: COLORS, borderColor: '#0F1A2E', borderWidth: 2 }}] }},
+  data: {{ labels: [], datasets: [{{ data: [], backgroundColor: COLORS, borderColor: '#161616', borderWidth: 2 }}] }},
   options: {{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ position: 'right', labels: {{ color: '#CBD5E1', font: {{ size: 11 }}, boxWidth: 12 }} }} }},
@@ -1383,7 +1681,7 @@ const platformByVideoChart = new Chart(document.getElementById('cPlatformByVideo
 
 const platformByYtChart = new Chart(document.getElementById('cPlatformByYt'), {{
   type: 'pie',
-  data: {{ labels: [], datasets: [{{ data: [], backgroundColor: COLORS, borderColor: '#0F1A2E', borderWidth: 2 }}] }},
+  data: {{ labels: [], datasets: [{{ data: [], backgroundColor: COLORS, borderColor: '#161616', borderWidth: 2 }}] }},
   options: {{
     responsive: true, maintainAspectRatio: false,
     plugins: {{ legend: {{ position: 'right', labels: {{ color: '#CBD5E1', font: {{ size: 11 }}, boxWidth: 12 }} }} }},
@@ -1628,7 +1926,7 @@ const volPerformanceChart = new Chart(document.getElementById('cVolPerformance')
   data: {{
     labels: [],
     datasets: [
-      {{ type: 'bar', label: '视频数量', data: [], yAxisID: 'yCount', backgroundColor: 'rgba(34,211,238,.55)', borderColor: '#22D3EE', borderWidth: 1, borderRadius: 3 }},
+      {{ type: 'bar', label: '视频数量', data: [], yAxisID: 'yCount', backgroundColor: 'rgba(255,0,51,.55)', borderColor: '#FF3355', borderWidth: 1, borderRadius: 3 }},
       {{ type: 'line', label: '已覆盖累计播放量', data: [], yAxisID: 'yViews', borderColor: '#F59E0B', backgroundColor: '#F59E0B', pointRadius: 4, pointHoverRadius: 6, tension: .25 }},
     ],
   }},
@@ -1644,7 +1942,7 @@ const volPerformanceChart = new Chart(document.getElementById('cVolPerformance')
     }},
     scales: {{
       x: {{ grid: {{ display: false }}, ticks: {{ color: '#CBD5E1', font: {{ size: 11 }} }} }},
-      yCount: {{ position: 'left', beginAtZero: true, grid: {{ color: 'rgba(255,255,255,0.05)' }}, ticks: {{ color: '#22D3EE', precision: 0 }}, title: {{ display: true, text: '视频数', color: '#22D3EE' }} }},
+      yCount: {{ position: 'left', beginAtZero: true, grid: {{ color: 'rgba(255,255,255,0.05)' }}, ticks: {{ color: '#FF8A9E', precision: 0 }}, title: {{ display: true, text: '视频数', color: '#FF8A9E' }} }},
       yViews: {{ position: 'right', beginAtZero: true, grid: {{ drawOnChartArea: false }}, ticks: {{ color: '#F59E0B', callback: compactNum }}, title: {{ display: true, text: '累计播放量', color: '#F59E0B' }} }},
     }},
   }},
@@ -1907,6 +2205,426 @@ function renderVolume() {{
 document.getElementById('volWindowSize').addEventListener('change', () => {{ closeDrill(); renderVolume(); }});
 document.getElementById('volWindowCount').addEventListener('change', () => {{ closeDrill(); renderVolume(); }});
 renderVolume();
+
+// ── Competitive YouTube Performance v2 (precomputed Python metrics) ─────
+const volGuideOpen=document.getElementById('volGuideOpen');
+const volGuideClose=document.getElementById('volGuideClose');
+const volGuideDrawer=document.getElementById('volGuideDrawer');
+const volGuideBackdrop=document.getElementById('volGuideBackdrop');
+const volGuideSearch=document.getElementById('volGuideSearch');
+let volGuideReturnFocus=null;
+function setVolGuide(open) {{
+  if(!volGuideDrawer)return;
+  volGuideDrawer.classList.toggle('is-open',open);volGuideBackdrop.classList.toggle('is-open',open);
+  volGuideDrawer.setAttribute('aria-hidden',String(!open));volGuideBackdrop.setAttribute('aria-hidden',String(!open));
+  volGuideOpen.setAttribute('aria-expanded',String(open));document.body.classList.toggle('guide-opened',open);
+  if(open){{volGuideReturnFocus=document.activeElement;requestAnimationFrame(()=>requestAnimationFrame(()=>volGuideClose.focus()));}}
+  else if(volGuideReturnFocus){{volGuideReturnFocus.focus();}}
+}}
+volGuideOpen?.addEventListener('click',()=>setVolGuide(true));
+volGuideClose?.addEventListener('click',()=>setVolGuide(false));
+volGuideBackdrop?.addEventListener('click',()=>setVolGuide(false));
+document.addEventListener('keydown',event=>{{
+  if(!volGuideDrawer?.classList.contains('is-open'))return;
+  if(event.key==='Escape'){{event.preventDefault();setVolGuide(false);return;}}
+  if(event.key!=='Tab')return;
+  const focusable=[...volGuideDrawer.querySelectorAll('button,input,summary,[href],[tabindex]:not([tabindex="-1"])')].filter(node=>!node.disabled&&node.offsetParent!==null);
+  if(!focusable.length)return;
+  const first=focusable[0],last=focusable.at(-1);
+  if(event.shiftKey&&document.activeElement===first){{event.preventDefault();last.focus();}}
+  else if(!event.shiftKey&&document.activeElement===last){{event.preventDefault();first.focus();}}
+}});
+volGuideSearch?.addEventListener('input',()=>{{
+  const query=volGuideSearch.value.trim().toLowerCase();let visible=0;
+  volGuideDrawer.querySelectorAll('.guide-group').forEach(group=>{{
+    let groupVisible=0;
+    group.querySelectorAll('.guide-term').forEach(term=>{{
+      const match=!query||term.textContent.toLowerCase().includes(query);term.hidden=!match;if(match){{groupVisible++;visible++;}}
+    }});
+    const intro=group.querySelector('.guide-intro');
+    const introMatch=Boolean(query&&intro?.textContent.toLowerCase().includes(query));
+    if(introMatch){{groupVisible++;visible++;}}
+    group.hidden=Boolean(query&&!groupVisible);if(query&&groupVisible)group.open=true;
+  }});
+  document.getElementById('volGuideEmpty').hidden=Boolean(visible||!query);
+}});
+
+const volSelectedV2 = new Set(CORE_COMPETITOR_PLATFORMS);
+let volChartsV2 = {{}};
+let volDrillStateV2 = null;
+const fmtNumV2 = value => value === null || value === undefined ? '—' : Number(value).toLocaleString();
+const fmtPctV2 = value => value === null || value === undefined ? '—' : `${{(Number(value) * 100).toFixed(1)}}%`;
+const escV2 = value => String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+const topKeyV2 = values => Object.entries(values || {{}}).sort((a,b) => b[1] - a[1])[0]?.[0] || '—';
+const colorV2 = platform => COLORS[Math.max(0, CORE_COMPETITOR_PLATFORMS.indexOf(platform)) % COLORS.length];
+const FIRST_ACCOUNT_DATE_V2 = new Map();
+(VOLUME_DATA.facts || []).forEach(row => {{
+  if (!row.account_key || !row.date) return;
+  const key = `${{row.platform}}||${{row.account_key}}`;
+  if (!FIRST_ACCOUNT_DATE_V2.has(key) || row.date < FIRST_ACCOUNT_DATE_V2.get(key)) FIRST_ACCOUNT_DATE_V2.set(key,row.date);
+}});
+
+function activeVolFilterV2(row) {{
+  const market = document.getElementById('volMarketFilter').value;
+  const language = document.getElementById('volLanguageFilter').value;
+  const method = document.getElementById('volMethodFilter').value;
+  const topic = document.getElementById('volTopicFilter').value;
+  const query = document.getElementById('volTextFilter').value.trim().toLowerCase();
+  return (!market || row.market === market) && (!language || row.language === language) &&
+    (!method || (row.promotion_methods || []).includes(method)) &&
+    (!topic || (row.content_topics || []).includes(topic)) &&
+    (!query || `${{row.account || ''}} ${{row.title || ''}}`.toLowerCase().includes(query));
+}}
+
+function initVolFiltersV2() {{
+  const facts = VOLUME_DATA.facts || [];
+  const fill = (id, values) => {{
+    const select = document.getElementById(id);
+    const first = select.options[0].outerHTML;
+    select.innerHTML = first + [...new Set(values.filter(Boolean))].sort().map(value => `<option value="${{escV2(value)}}">${{escV2(value)}}</option>`).join('');
+  }};
+  fill('volMarketFilter', facts.map(row => row.market));
+  fill('volLanguageFilter', facts.map(row => row.language));
+  fill('volMethodFilter', facts.flatMap(row => row.promotion_methods || []));
+  fill('volTopicFilter', facts.flatMap(row => row.content_topics || []));
+  const defaultWindow = (VOLUME_DATA.windows?.['7'] || [])[0]?.window;
+  if (defaultWindow) {{
+    document.getElementById('volDateFrom').value = defaultWindow.start;
+    document.getElementById('volDateTo').value = defaultWindow.end;
+  }}
+}}
+
+const counterV2 = (rows,key) => {{
+  const result={{}};
+  rows.forEach(row => {{ const values=Array.isArray(row[key])?row[key]:[row[key]]; values.filter(Boolean).forEach(value=>result[value]=(result[value]||0)+1); }});
+  return result;
+}};
+const medianV2 = values => {{ if(!values.length)return null; const sorted=values.slice().sort((a,b)=>a-b),mid=Math.floor(sorted.length/2); return sorted.length%2?sorted[mid]:(sorted[mid-1]+sorted[mid])/2; }};
+const coverageV2 = (rows,test) => ({{covered:rows.filter(test).length,total:rows.length,rate:rows.length?rows.filter(test).length/rows.length:null}});
+
+function earlyKeysV2(rows) {{
+  const groups=new Map(),result=new Set();
+  rows.forEach(row=>{{if(row.observation_bucket==='Unknown'||row.view_count==null)return;if(!groups.has(row.observation_bucket))groups.set(row.observation_bucket,[]);groups.get(row.observation_bucket).push(row);}});
+  groups.forEach(items=>{{if(items.length<5)return;items.sort((a,b)=>b.view_count-a.view_count).slice(0,Math.ceil(items.length*.2)).forEach(row=>result.add(`${{row.platform}}||${{row.video_url}}`));}});
+  return result;
+}}
+
+function metricFromFactsV2(platform,rows,previousRows,denominator,previousDenominator,early,currentStart) {{
+  const accounts=counterV2(rows,'account_key'),ordered=Object.entries(accounts).sort((a,b)=>b[1]-a[1]);
+  const previousAccounts=new Set(previousRows.map(row=>row.account_key).filter(Boolean));
+  const currentAccounts=new Set(rows.map(row=>row.account_key).filter(Boolean));
+  const methods=counterV2(rows,'promotion_methods'),topics=counterV2(rows,'content_topics');
+  const previousMethods=counterV2(previousRows,'promotion_methods'),previousTopics=counterV2(previousRows,'content_topics');
+  const views=rows.map(row=>row.view_count).filter(value=>value!=null);
+  const engagement=rows.filter(row=>row.initial_engagement_rate!=null);
+  const top1=ordered[0]?.[1]||0,top3=ordered.slice(0,3).reduce((sum,item)=>sum+item[1],0),count=rows.length;
+  const top1Share=count?top1/count:null;
+  const concentration=count<3?'样本不足':top1Share>=.6?'高度集中':top1Share>=.4?'相对集中':'相对分散';
+  const methodShares=Object.fromEntries(Object.entries(methods).map(([key,value])=>[key,value/count]));
+  const previousMethodShares=Object.fromEntries(Object.entries(previousMethods).map(([key,value])=>[key,value/(previousRows.length||1)]));
+  const topicShares=Object.fromEntries(Object.entries(topics).map(([key,value])=>[key,value/count]));
+  const previousTopicShares=Object.fromEntries(Object.entries(previousTopics).map(([key,value])=>[key,value/(previousRows.length||1)]));
+  const change=count-previousRows.length,pct=previousRows.length?change/previousRows.length*100:null;
+  const signals=[];
+  if(count<3)signals.push('数据不足');
+  else {{
+    if(['高度集中','相对集中'].includes(concentration))signals.push('集中铺量');else if(currentAccounts.size>=4&&top1Share<.4)signals.push('长尾扩张');
+    if((methodShares.description_only||0)>=.6)signals.push('Description挂链为主');
+    if((methodShares.multi_platform||0)>=.5)signals.push('Multi-platform为主');
+    if((methodShares.official||0)>=.5)signals.push('官方内容驱动');
+    if((topics.Activity||0)-(previousTopics.Activity||0)>=3)signals.push('活动内容增长');
+    if((topics.Product||0)-(previousTopics.Product||0)>=3)signals.push('产品内容增长');
+  }}
+  return {{
+    platform,promotion_records:rows.reduce((sum,row)=>sum+(row.promotion_record_count||0),0),videos:count,
+    promotion_share:denominator?count/denominator:null,previous_promotion_share:previousDenominator?previousRows.length/previousDenominator:null,
+    accounts:currentAccounts.size,new_observed_accounts:[...currentAccounts].filter(key=>FIRST_ACCOUNT_DATE_V2.get(`${{platform}}||${{key}}`)>=currentStart).length,
+    continuous_accounts:[...currentAccounts].filter(key=>previousAccounts.has(key)).length,top1_share:top1Share,top3_share:count?top3/count:null,
+    concentration_signal:concentration,videos_per_account:currentAccounts.size?count/currentAccounts.size:null,
+    method_counts:methods,method_shares:methodShares,topic_counts:topics,topic_shares:topicShares,
+    language_counts:counterV2(rows,'language'),market_counts:counterV2(rows,'market'),first_views_median:medianV2(views),
+    early_high_performers:rows.filter(row=>early.has(`${{platform}}||${{row.video_url}}`)).length,
+    initial_engagement_rate:engagement.length&&engagement.reduce((s,r)=>s+(r.view_count||0),0)>0?engagement.reduce((s,r)=>s+(r.like_count+r.comment_count),0)/engagement.reduce((s,r)=>s+r.view_count,0):null,
+    growth:{{current:count,previous:previousRows.length,change,percent:pct,significant:pct!=null&&Math.abs(pct)>=30&&Math.abs(change)>=3}},
+    previous_structure:{{method_shares:previousMethodShares,topic_shares:previousTopicShares}},signals:(signals.length?signals:['暂无显著结构信号']).slice(0,3),
+    coverage:{{video_details:coverageV2(rows,r=>r.detail_available),first_views:coverageV2(rows,r=>r.view_count!=null),likes_comments:coverageV2(rows,r=>r.like_count!=null&&r.comment_count!=null),late_snapshot:coverageV2(rows,r=>r.backfill_captured_at),promotion_method:coverageV2(rows,r=>r.promotion_methods?.length),content_topic:coverageV2(rows,r=>r.detail_available&&r.content_topics?.length),market:coverageV2(rows,r=>r.market),language:coverageV2(rows,r=>r.language),observation_age:coverageV2(rows,r=>r.observation_bucket!=='Unknown')}}
+  }};
+}}
+
+function filteredSummaryV2(base) {{
+  const facts=(VOLUME_DATA.facts||[]).filter(activeVolFilterV2);
+  const current=facts.filter(row=>row.date>=base.window.start&&row.date<=base.window.end);
+  const previous=facts.filter(row=>row.date>=base.previous_window.start&&row.date<=base.previous_window.end);
+  const early=earlyKeysV2(current);
+  return {{...base,total_videos:current.length,early_high_keys:[...early].map(key=>key.split('||')),platforms:CORE_COMPETITOR_PLATFORMS.map(platform=>metricFromFactsV2(platform,current.filter(row=>row.platform===platform),previous.filter(row=>row.platform===platform),current.length,previous.length,early,base.window.start))}};
+}}
+
+function shiftDateV2(value,days) {{ const d=new Date(`${{value}}T00:00:00Z`);d.setUTCDate(d.getUTCDate()+days);return d.toISOString().slice(0,10); }}
+function selectedSpanV2(start,end) {{ return Math.round((new Date(`${{end}}T00:00:00Z`)-new Date(`${{start}}T00:00:00Z`))/86400000)+1; }}
+function customWindowsV2(start,end,count) {{
+  const span=selectedSpanV2(start,end);
+  return Array.from({{length:count}},(_,index)=>{{
+    const windowEnd=shiftDateV2(end,-index*span),windowStart=shiftDateV2(windowEnd,-span+1),previousEnd=shiftDateV2(windowStart,-1),previousStart=shiftDateV2(previousEnd,-span+1);
+    return {{window:{{start:windowStart,end:windowEnd}},previous_window:{{start:previousStart,end:previousEnd}},platforms:[]}};
+  }});
+}}
+
+function chartV2(id, config) {{
+  if (volChartsV2[id]) volChartsV2[id].destroy();
+  const canvas = document.getElementById(id);
+  if (canvas) volChartsV2[id] = new Chart(canvas, config);
+}}
+
+function renderVolChipsV2(start,end) {{
+  const totals = Object.fromEntries(CORE_COMPETITOR_PLATFORMS.map(p => [p, 0]));
+  (VOLUME_DATA.facts || []).filter(row => activeVolFilterV2(row) && row.date >= start && row.date <= end)
+    .forEach(row => totals[row.platform] = (totals[row.platform] || 0) + 1);
+  const root = document.getElementById('volPlatformChips');
+  root.innerHTML = CORE_COMPETITOR_PLATFORMS.map(p => `<button type="button" class="platform-chip${{volSelectedV2.has(p) ? ' active' : ''}}" data-platform="${{escV2(p)}}" aria-pressed="${{volSelectedV2.has(p)}}">${{escV2(p)}} <b>${{totals[p] || 0}}</b></button>`).join('');
+  root.querySelectorAll('button').forEach(button => button.addEventListener('click', () => {{
+    const platform = button.dataset.platform;
+    if (volSelectedV2.has(platform) && volSelectedV2.size > 1) volSelectedV2.delete(platform);
+    else volSelectedV2.add(platform);
+    renderVolumeV2();
+  }}));
+}}
+
+function renderHeatmapV2(id, metrics, field, labels) {{
+  const maxValue = Math.max(1, ...metrics.flatMap(m => labels.map(label => Number((m[field] || {{}})[label] || 0))));
+  const cols = `110px repeat(${{labels.length}},minmax(88px,1fr))`;
+  let html = `<div class="heatmap" style="grid-template-columns:${{cols}}"><div class="heat-label">竞品</div>${{labels.map(label => `<div class="heat-col-label" title="${{escV2(label)}}">${{escV2(label)}}</div>`).join('')}}`;
+  metrics.forEach(metric => {{
+    html += `<div class="heat-label">${{escV2(metric.platform)}}</div>`;
+    labels.forEach(label => {{
+      const value = Number((metric[field] || {{}})[label] || 0);
+      const alpha = value ? .12 + .68 * value / maxValue : .025;
+      html += `<div style="background:rgba(255,0,51,${{alpha.toFixed(2)}})" title="${{escV2(metric.platform)}} · ${{escV2(label)}}：${{value}}">${{value}}</div>`;
+    }});
+  }});
+  document.getElementById(id).innerHTML = html + '</div>';
+}}
+
+function methodEvidenceTextV2(method,row) {{
+  if(method==='brand_led')return `标题中命中竞品名称“${{row.platform}}”`;
+  if(method==='description_only')return `推广链接命中 ${{row.platform}}，但标题未出现竞品名`;
+  if(method==='multi_platform')return `同一视频共命中 ${{row.promoted_platform_count}} 个推广平台`;
+  if(method==='official')return `Channel ID 命中明确配置的 ${{row.platform}} 官方频道`;
+  if(method==='unclassified')return '标题、链接与频道证据不足';
+  return (row.promotion_method_evidence||{{}})[method]||'未记录具体依据';
+}}
+
+function evidenceDetailsV2(row) {{
+  const methods=(row.promotion_methods||[]).map(method=>`<div class="tag-evidence-item"><code>${{escV2(method)}}</code><span>${{escV2(methodEvidenceTextV2(method,row))}}</span></div>`).join('');
+  const topics=(row.content_topics||[]).map(topic=>{{
+    const matched=(row.content_topic_evidence||{{}})[topic]||[];
+    const text=topic==='Other'?'未命中已配置的主题关键词':(matched.length?`命中词：${{matched.join(' / ')}}`:'未记录命中词');
+    return `<div class="tag-evidence-item"><code>${{escV2(topic)}}</code><span>${{escV2(text)}}</span></div>`;
+  }}).join('');
+  return `<details class="tag-evidence"><summary>查看判定依据</summary><div class="tag-evidence-body">${{methods?`<section class="tag-evidence-group"><b>推广方式</b>${{methods}}</section>`:''}}${{topics?`<section class="tag-evidence-group"><b>内容主题</b>${{topics}}</section>`:''}}</div></details>`;
+}}
+
+function closeVolDrillV2() {{
+  volDrillStateV2 = null;
+  const panel = document.getElementById('volDrillPanel');
+  panel.style.display = 'none';
+  panel.innerHTML = '';
+}}
+
+function openVolDrillV2(platform, summary, options={{}}) {{
+  const shouldFocus = options.focus !== false;
+  const source = options.source || 'window';
+  const start = summary.window.start, end = summary.window.end;
+  const early = new Set((summary.early_high_keys || []).map(key => key.join('||')));
+  const rows = (VOLUME_DATA.facts || []).filter(row => activeVolFilterV2(row) && row.platform === platform && row.date >= start && row.date <= end)
+    .sort((a,b) => (b.view_count ?? -1) - (a.view_count ?? -1));
+  const titleCovered = rows.filter(row => row.title).length;
+  volDrillStateV2 = {{platform,start,end,source}};
+  const panel = document.getElementById('volDrillPanel');
+  panel.innerHTML = `<div class="section-head"><h3>${{escV2(platform)}} · 视频明细</h3><span class="hint-inline">${{start}} — ${{end}} · ${{rows.length}} 个去重推广视频 · 标题覆盖 ${{titleCovered}}/${{rows.length}}</span></div>
+    <div class="table-wrap"><table class="detail-table"><thead><tr><th>账号 / 市场</th><th>推广方式 / 主题</th><th>首采表现</th><th>观察时长</th><th>视频标题</th><th>推广平台</th></tr></thead><tbody>${{rows.map(row => {{
+      const rate = row.initial_engagement_rate;
+      const high = early.has(`${{row.platform}}||${{row.video_url}}`) ? '<span class="signal-pill">早期高表现</span>' : '';
+      const late = row.backfill_captured_at ? `<div class="kpi-sub" title="历史补采时点的当前统计，不代表首采表现">补采播放 ${{fmtNumV2(row.backfill_view_count)}} · 赞 ${{fmtNumV2(row.backfill_like_count)}} · 评 ${{fmtNumV2(row.backfill_comment_count)}}</div>` : '';
+      return `<tr><td><strong>${{escV2(row.account || '—')}}</strong><div class="kpi-sub">${{escV2([row.market,row.language].filter(Boolean).join(' · ') || '—')}}</div></td>
+        <td><div class="detail-tags">${{(row.promotion_methods || []).map(x => `<span class="signal-pill method-pill">${{escV2(x)}}</span>`).join('')}}</div><div class="detail-tags">${{(row.content_topics || []).map(x => `<span class="signal-pill">${{escV2(x)}}</span>`).join('')}}</div>${{evidenceDetailsV2(row)}}</td>
+        <td>首采播放 ${{fmtNumV2(row.view_count)}}<div class="kpi-sub">首采赞 ${{fmtNumV2(row.like_count)}} · 评 ${{fmtNumV2(row.comment_count)}} · 互动 ${{fmtPctV2(rate)}}</div>${{late}}${{high}}</td>
+        <td>${{row.observation_bucket === 'Unknown' ? '—' : escV2(row.observation_bucket)}}<div class="kpi-sub">${{row.observation_age_hours == null ? '—' : `${{Number(row.observation_age_hours).toFixed(1)}}h`}}</div></td>
+        <td><a class="detail-title-link${{row.title ? '' : ' is-missing'}}" href="${{escV2(row.video_url)}}" target="_blank" rel="noopener noreferrer">${{escV2(row.title || '标题暂未采集（点击查看原视频）')}}</a></td><td>${{row.promoted_platform_count}}</td></tr>`;
+    }}).join('')}}</tbody></table></div>`;
+  panel.style.display = 'block';
+  if (shouldFocus) {{
+    panel.focus({{preventScroll:true}});
+    panel.scrollIntoView({{behavior:'smooth',block:'nearest'}});
+  }}
+}}
+
+function renderVolumeV2() {{
+  const count = Number(document.getElementById('volWindowCount').value);
+  const dateFrom=document.getElementById('volDateFrom').value,dateTo=document.getElementById('volDateTo').value;
+  if((dateFrom&&!dateTo)||(!dateFrom&&dateTo)||dateFrom>dateTo){{document.getElementById('volMeta').textContent='请选择完整且有效的开始、结束日期';return;}}
+  const defaultWindow = (VOLUME_DATA.windows?.['7'] || [])[0]?.window;
+  const activeStart = dateFrom || defaultWindow?.start, activeEnd = dateTo || defaultWindow?.end;
+  const allWindows = activeStart&&activeEnd?customWindowsV2(activeStart,activeEnd,count):[];
+  if (!allWindows.length) {{ document.getElementById('volMeta').textContent = '暂无数据'; return; }}
+  const windows = allWindows.slice(0, count).map(filteredSummaryV2), latest = windows[0];
+  const span = selectedSpanV2(latest.window.start,latest.window.end);
+  renderVolChipsV2(latest.window.start,latest.window.end);
+  const selected = CORE_COMPETITOR_PLATFORMS.filter(p => volSelectedV2.has(p));
+  const metrics = latest.platforms.filter(m => volSelectedV2.has(m.platform));
+  document.getElementById('volMeta').textContent = `指定期间 ${{latest.window.start}} — ${{latest.window.end}} · ${{span}} 天 · ${{selected.length}} 个竞品`;
+  document.getElementById('volMatrixPeriod').textContent = `${{latest.window.start}} — ${{latest.window.end}} · 对比 ${{latest.previous_window.start}} — ${{latest.previous_window.end}}`;
+
+  const totalVideos = metrics.reduce((sum,m) => sum + m.videos, 0);
+  const totalPrevious = metrics.reduce((sum,m) => sum + m.growth.previous, 0);
+  const totalChange = totalVideos - totalPrevious;
+  const totalGrowth = totalPrevious ? totalChange / totalPrevious : null;
+  const shareLeader = metrics.slice().sort((a,b) => (b.promotion_share || 0) - (a.promotion_share || 0))[0];
+  const shareMomentum = metrics
+    .filter(m => m.promotion_share != null && m.previous_promotion_share != null)
+    .map(m => ({{...m,share_change:m.promotion_share-m.previous_promotion_share}}))
+    .filter(m => m.share_change > 0)
+    .sort((a,b) => b.share_change-a.share_change)[0];
+  const scopedFacts = (VOLUME_DATA.facts || []).filter(row => activeVolFilterV2(row) && selected.includes(row.platform) && row.date >= latest.window.start && row.date <= latest.window.end);
+  const distinctAccounts = new Set(scopedFacts.map(row => row.account_key).filter(Boolean)).size;
+  document.getElementById('volKpiVideos').textContent = fmtNumV2(totalVideos);
+  document.getElementById('volKpiWow').textContent = totalGrowth === null ? `较前期 ${{totalChange >= 0 ? '+' : ''}}${{totalChange}}` : `GR ${{totalGrowth >= 0 ? '+' : ''}}${{(totalGrowth*100).toFixed(1)}}% · ${{totalChange >= 0 ? '+' : ''}}${{totalChange}}`;
+  document.getElementById('volKpiShare').textContent = shareLeader ? `${{shareLeader.platform}} ${{fmtPctV2(shareLeader.promotion_share)}}` : '—';
+  document.getElementById('volKpiAccounts').textContent = fmtNumV2(distinctAccounts);
+  document.getElementById('volKpiEarly').textContent = fmtNumV2(metrics.reduce((sum,m) => sum + m.early_high_performers, 0));
+  document.getElementById('volKpiMomentum').textContent = shareMomentum ? `${{shareMomentum.platform}} +${{(shareMomentum.share_change*100).toFixed(1)}}pp` : '暂无提升';
+  const activeLabels = [document.getElementById('volMarketFilter').value,document.getElementById('volLanguageFilter').value,document.getElementById('volMethodFilter').value,document.getElementById('volTopicFilter').value,document.getElementById('volTextFilter').value.trim()].filter(Boolean);
+  document.getElementById('volFilterMeta').textContent = `指定期间命中 ${{scopedFacts.length}} 个去重竞品视频${{activeLabels.length ? ` · 已启用 ${{activeLabels.length}} 个条件` : ''}}`;
+  const marketFilter=document.getElementById('volMarketFilter').value,languageFilter=document.getElementById('volLanguageFilter').value;
+  const methodFilter=document.getElementById('volMethodFilter').value,topicFilter=document.getElementById('volTopicFilter').value,textFilter=document.getElementById('volTextFilter').value.trim();
+  const structureFilters=[marketFilter&&`市场 ${{marketFilter}}`,languageFilter&&`语言 ${{languageFilter}}`,methodFilter&&`方式 ${{methodFilter}}`,topicFilter&&`主题 ${{topicFilter}}`,textFilter&&`搜索“${{textFilter}}”`,selected.length<CORE_COMPETITOR_PLATFORMS.length&&`竞品 ${{selected.join(' / ')}}`].filter(Boolean);
+  const structureContext=`${{latest.window.start}} — ${{latest.window.end}} · ${{scopedFacts.length}} 条${{structureFilters.length?` · ${{structureFilters.join(' · ')}}`:' · 全部条件'}}`;
+  ['volTopicContext','volMethodContext','volMarketContext','volAccountContext'].forEach(id=>document.getElementById(id).textContent=structureContext);
+
+  const matrix = document.getElementById('volMatrixBody');
+  const matrixLeaders = {{
+    videos: Math.max(0,...metrics.map(metric=>metric.videos||0)),
+    share: Math.max(0,...metrics.map(metric=>metric.promotion_share||0)),
+  }};
+  matrix.innerHTML = metrics.map(metric => {{
+    const growth = metric.growth.percent;
+    const growthText = growth === null ? (metric.videos ? `NEW (+${{metric.growth.change}})` : '—') : `${{growth >= 0 ? '+' : ''}}${{growth.toFixed(1)}}% (${{metric.growth.change >= 0 ? '+' : ''}}${{metric.growth.change}})`;
+    const growthClass = metric.growth.significant ? `gr-significant${{growth < 0 ? ' negative' : ''}}` : '';
+    const videoLeaderClass=metric.videos===matrixLeaders.videos?'metric-leader':'';
+    const shareLeaderClass=metric.promotion_share===matrixLeaders.share?'metric-leader':'';
+    return `<tr class="matrix-row" tabindex="0" data-platform="${{escV2(metric.platform)}}"><td><strong>${{escV2(metric.platform)}}</strong><div class="kpi-sub">记录 ${{metric.promotion_records}}</div></td><td class="${{videoLeaderClass}}"><span class="matrix-value">${{metric.videos}}</span></td><td class="${{shareLeaderClass}}"><span class="matrix-value">${{fmtPctV2(metric.promotion_share)}}</span><div class="kpi-sub">前期 ${{fmtPctV2(metric.previous_promotion_share)}}</div></td><td class="${{growthClass}}">${{growthText}}</td><td><span class="matrix-value">${{metric.accounts}}</span><div class="kpi-sub">连续 ${{metric.continuous_accounts}} · 均 ${{metric.videos_per_account == null ? '—' : metric.videos_per_account.toFixed(1)}}</div></td><td>${{metric.new_observed_accounts}}</td><td>${{fmtPctV2(metric.top1_share)}}<div class="kpi-sub">${{escV2(metric.concentration_signal)}}</div></td><td>${{fmtNumV2(metric.first_views_median)}}</td><td>${{metric.early_high_performers}}</td><td><span class="signal-pill method-pill">${{escV2(topKeyV2(metric.method_counts))}}</span></td><td><span class="signal-pill">${{escV2(topKeyV2(metric.topic_counts))}}</span></td><td><div class="signal-list">${{metric.signals.map(x => `<span class="signal-pill">${{escV2(x)}}</span>`).join('')}}</div></td></tr>`;
+  }}).join('');
+  matrix.querySelectorAll('.matrix-row').forEach(row => {{
+    const open = () => openVolDrillV2(row.dataset.platform, latest,{{source:'latest'}});
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', event => {{ if (event.key === 'Enter' || event.key === ' ') {{ event.preventDefault(); open(); }} }});
+  }});
+
+  const accountValues=metrics.map(m=>m.accounts||0),accountMin=Math.min(...accountValues),accountMax=Math.max(...accountValues);
+  // Bubble area carries account count, but radius stays within 7–16px so the
+  // third metric remains visible without obscuring neighbouring anchors.
+  const accountRadius = value => {{
+    if(accountMax===accountMin)return 11;
+    const normalized=(value-accountMin)/(accountMax-accountMin);
+    return Math.sqrt(7*7+normalized*(16*16-7*7));
+  }};
+  const smallestAccount=metrics.slice().sort((a,b)=>a.accounts-b.accounts)[0],largestAccount=metrics.slice().sort((a,b)=>b.accounts-a.accounts)[0];
+  const bubbleScaleText=smallestAccount&&largestAccount?`Size 范围：${{smallestAccount.platform}} ${{smallestAccount.accounts}} 个账号 → ${{largestAccount.platform}} ${{largestAccount.accounts}} 个账号；圆面积按当前筛选结果归一化，半径限制 7–16px。`:'暂无账号规模数据';
+  document.getElementById('volBrandBubbleScale').textContent=bubbleScaleText;
+  document.getElementById('volViewBubbleScale').textContent=bubbleScaleText;
+  const bubbleBase = (yKey, yTitle, percent) => ({{
+    type: 'bubble',
+    data: {{ datasets: metrics.map(m => ({{
+      label: m.platform,
+      data: [{{x:m.videos, y:m[yKey], accounts:m.accounts, r:accountRadius(m.accounts||0)}}],
+      backgroundColor: `${{colorV2(m.platform)}}66`, borderColor: colorV2(m.platform), borderWidth: 2,
+      hoverBackgroundColor: `${{colorV2(m.platform)}}99`, hoverBorderWidth: 2, hoverRadius: 2,
+      pointStyle: 'circle',
+    }})) }},
+    options: {{
+      responsive:true, maintainAspectRatio:false,
+      plugins: {{
+        legend: {{position:'bottom',labels:{{color:'#CBD5E1',usePointStyle:true}}}},
+        tooltip: {{callbacks:{{label:ctx => `${{ctx.dataset.label}}：推广视频 ${{ctx.raw.x}} · ${{yTitle}} ${{percent ? fmtPctV2(ctx.raw.y) : fmtNumV2(ctx.raw.y)}} · 独立账号 ${{ctx.raw.accounts}}`}}}},
+      }},
+      scales: {{
+        x: {{beginAtZero:true,title:{{display:true,text:'去重推广视频数',color:'#94A3B8'}},ticks:{{precision:0,color:'#64748B'}},grid:{{color:'rgba(255,255,255,.05)'}}}},
+        y: {{beginAtZero:true,max:percent?1:undefined,title:{{display:true,text:yTitle,color:'#94A3B8'}},ticks:{{color:'#64748B',callback:v=>percent?`${{v*100}}%`:fmtNumV2(v)}},grid:{{color:'rgba(255,255,255,.05)'}}}},
+      }},
+    }},
+  }});
+  // Nested method share is flattened explicitly for Chart.js.
+  metrics.forEach(m => m.brand_led_share = (m.method_shares || {{}}).brand_led || 0);
+  chartV2('cVolBrandBubble', bubbleBase('brand_led_share','brand_led 占比',true));
+  chartV2('cVolViewBubble', bubbleBase('first_views_median','首采播放量中位数',false));
+
+  const chrono = windows.slice().reverse();
+  const lineOptions = percent => ({{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'bottom',labels:{{color:'#CBD5E1',usePointStyle:true}}}}}},scales:{{x:{{ticks:{{color:'#64748B'}},grid:{{display:false}}}},y:{{beginAtZero:true,max:percent?1:undefined,ticks:{{color:'#64748B',callback:v=>percent?`${{Math.round(v*100)}}%`:v}},grid:{{color:'rgba(255,255,255,.05)'}}}}}}}});
+  chartV2('cVolTrend', {{type:'line',data:{{labels:chrono.map(w=>w.window.start),datasets:selected.map(p=>({{label:p,data:chrono.map(w=>w.platforms.find(m=>m.platform===p)?.videos||0),borderColor:colorV2(p),backgroundColor:'transparent',tension:.25,borderWidth:p==='Zoomex'?3.5:2,pointRadius:p==='Zoomex'?4:2.5}}))}},options:lineOptions(false)}});
+  chartV2('cVolShareTrend', {{type:'line',data:{{labels:chrono.map(w=>w.window.start),datasets:selected.map(p=>({{label:p,data:chrono.map(w=>w.platforms.find(m=>m.platform===p)?.promotion_share||0),borderColor:colorV2(p),backgroundColor:'transparent',tension:.25,borderWidth:p==='Zoomex'?3.5:2,pointRadius:p==='Zoomex'?4:2.5}}))}},options:lineOptions(true)}});
+
+  const topicLabels = topicFilter?[topicFilter]:['Activity','Product','Tutorial','Market Analysis','Trading Signal','Review/Comparison','Listing','Brand Introduction','Other'];
+  renderHeatmapV2('volTopicHeatmap', metrics, 'topic_counts', topicLabels);
+  const selectedGeoLabels=[marketFilter&&`市场 ${{marketFilter}}`,languageFilter&&`语言 ${{languageFilter}}`].filter(Boolean);
+  const marketLabels = selectedGeoLabels.length?selectedGeoLabels:Array.from(new Set(metrics.flatMap(m => [...Object.keys(m.market_counts||{{}}).map(x=>`市场 ${{x}}`),...Object.keys(m.language_counts||{{}}).map(x=>`语言 ${{x}}`) ]))).slice(0,10);
+  const heatMetrics = metrics.map(m => ({{...m,geo_counts:Object.fromEntries([...Object.entries(m.market_counts||{{}}).map(([k,v])=>[`市场 ${{k}}`,v]),...Object.entries(m.language_counts||{{}}).map(([k,v])=>[`语言 ${{k}}`,v])])}}));
+  renderHeatmapV2('volMarketHeatmap', heatMetrics, 'geo_counts', marketLabels);
+
+  const methodLabels = methodFilter?[methodFilter]:['brand_led','description_only','multi_platform','official','unclassified'];
+  chartV2('cVolMethods', {{
+    type:'bar',
+    data:{{labels:metrics.map(m=>m.platform),datasets:methodLabels.map((method,i)=>({{label:method,data:metrics.map(m=>m.method_shares[method]||0),backgroundColor:COLORS[i%COLORS.length]}}))}},
+    options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'bottom',labels:{{color:'#CBD5E1',boxWidth:10}}}}}},scales:{{x:{{ticks:{{color:'#CBD5E1'}},grid:{{display:false}}}},y:{{beginAtZero:true,max:1,ticks:{{color:'#64748B',callback:v=>`${{v*100}}%`}},grid:{{color:'rgba(255,255,255,.05)'}}}}}}}},
+  }});
+  chartV2('cVolAccounts', {{
+    type:'bar',
+    data:{{labels:metrics.map(m=>m.platform),datasets:[
+      {{label:'Top1 占比',data:metrics.map(m=>m.top1_share||0),backgroundColor:'#D85C72',yAxisID:'yPct'}},
+      {{label:'Top3 占比',data:metrics.map(m=>m.top3_share||0),backgroundColor:'#B96BC7',yAxisID:'yPct'}},
+      {{label:'新观察账号',data:metrics.map(m=>m.new_observed_accounts),backgroundColor:'#F3BA4B',yAxisID:'yCount'}},
+      {{label:'连续推广账号',data:metrics.map(m=>m.continuous_accounts),backgroundColor:'#FF7A45',yAxisID:'yCount'}},
+    ]}},
+    options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{position:'bottom',labels:{{color:'#CBD5E1',boxWidth:10}}}}}},scales:{{x:{{ticks:{{color:'#CBD5E1'}},grid:{{display:false}}}},yPct:{{position:'left',beginAtZero:true,max:1,ticks:{{color:'#64748B',callback:v=>`${{v*100}}%`}}}},yCount:{{position:'right',beginAtZero:true,ticks:{{color:'#64748B',precision:0}},grid:{{drawOnChartArea:false}}}}}}}},
+  }});
+
+  document.getElementById('volTableHead').innerHTML = '<th>窗口</th>' + selected.map(p=>`<th>${{escV2(p)}}</th><th>Share</th>`).join('');
+  document.getElementById('volTableBody').innerHTML = windows.map((summary,index)=>`<tr><td>${{summary.window.start}} — ${{summary.window.end}}</td>${{selected.map(p=>{{const m=summary.platforms.find(x=>x.platform===p);return `<td class="vol-cell" tabindex="0" data-index="${{index}}" data-platform="${{escV2(p)}}">${{m?.videos||0}}</td><td>${{fmtPctV2(m?.promotion_share)}}</td>`;}}).join('')}}</tr>`).join('');
+  document.querySelectorAll('#volTableBody .vol-cell').forEach(cell => {{ const open=()=>openVolDrillV2(cell.dataset.platform,windows[Number(cell.dataset.index)],{{source:'window'}}); cell.addEventListener('click',open); cell.addEventListener('keydown',e=>{{if(e.key==='Enter'||e.key===' '){{e.preventDefault();open();}}}}); }});
+  if (volDrillStateV2) {{
+    const state = volDrillStateV2;
+    const summary = state.source === 'latest' ? latest : windows.find(item => item.window.start === state.start && item.window.end === state.end);
+    if (summary && selected.includes(state.platform)) openVolDrillV2(state.platform,summary,{{focus:false,source:state.source}});
+    else closeVolDrillV2();
+  }}
+}}
+
+initVolFiltersV2();
+document.getElementById('volWindowSize').addEventListener('change',event=>{{
+  if(event.target.value==='custom')return;
+  const days=Number(event.target.value),defaultWindow=(VOLUME_DATA.windows?.['7']||[])[0]?.window;
+  if(!defaultWindow)return;
+  document.getElementById('volDateTo').value=defaultWindow.end;
+  document.getElementById('volDateFrom').value=shiftDateV2(defaultWindow.end,-days+1);
+  renderVolumeV2();
+}});
+['volDateFrom','volDateTo'].forEach(id=>document.getElementById(id).addEventListener('change',()=>{{
+  const start=document.getElementById('volDateFrom').value,end=document.getElementById('volDateTo').value;
+  if(start&&end&&start<=end){{
+    const span=String(selectedSpanV2(start,end));
+    document.getElementById('volWindowSize').value=['7','14','30'].includes(span)?span:'custom';
+  }} else document.getElementById('volWindowSize').value='custom';
+  renderVolumeV2();
+}}));
+['volWindowCount','volMarketFilter','volLanguageFilter','volMethodFilter','volTopicFilter'].forEach(id=>document.getElementById(id).addEventListener('change',renderVolumeV2));
+let volSearchTimer;
+document.getElementById('volTextFilter').addEventListener('input',()=>{{clearTimeout(volSearchTimer);volSearchTimer=setTimeout(renderVolumeV2,180);}});
+document.getElementById('volFilterReset').addEventListener('click',()=>{{
+  ['volMarketFilter','volLanguageFilter','volMethodFilter','volTopicFilter','volTextFilter'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('volWindowSize').value='7';document.getElementById('volWindowCount').value='4';
+  const defaultWindow=(VOLUME_DATA.windows?.['7']||[])[0]?.window;
+  if(defaultWindow){{document.getElementById('volDateFrom').value=defaultWindow.start;document.getElementById('volDateTo').value=defaultWindow.end;}}
+  volSelectedV2.clear();CORE_COMPETITOR_PLATFORMS.forEach(platform=>volSelectedV2.add(platform));renderVolumeV2();
+}});
+renderVolumeV2();
 </script>
 </body>
 </html>
@@ -1914,27 +2632,29 @@ renderVolume();
     return _prune_generated_page(html_output, page_mode)
 
 
-def run():
+def run(page: str = "all"):
     leads = load_leads()
-    channels = load_channels()
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
     weekly_insight = load_weekly_insight()
-    html = generate_html(leads, channels, run_date, weekly_insight, page_mode="main")
-    channels_html = generate_html(leads, channels, run_date, weekly_insight, page_mode="channels")
-    volume_html = generate_html(leads, channels, run_date, weekly_insight, page_mode="volume")
-
     OUT_DIR.mkdir(exist_ok=True)
-    OUT_PATH.write_text(html, encoding="utf-8")
-    CHANNELS_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CHANNELS_OUT_PATH.write_text(channels_html, encoding="utf-8")
-    VOLUME_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    VOLUME_OUT_PATH.write_text(volume_html, encoding="utf-8")
-    print(
-        f"[Report] Generated {OUT_PATH}, {CHANNELS_OUT_PATH}, and {VOLUME_OUT_PATH} "
-        f"({len(leads)} leads, {len(channels)} channels)"
-    )
+    generated = []
+    public_channels = load_channels() if page in {"all", "main", "channels"} else []
+    if page in {"all", "main"}:
+        OUT_PATH.write_text(generate_html(leads, public_channels, run_date, weekly_insight, "main"), encoding="utf-8")
+        generated.append(OUT_PATH)
+    if page in {"all", "channels"}:
+        CHANNELS_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CHANNELS_OUT_PATH.write_text(generate_html(leads, public_channels, run_date, weekly_insight, "channels"), encoding="utf-8")
+        generated.append(CHANNELS_OUT_PATH)
+    if page in {"all", "volume"}:
+        volume_channels = load_channels(include_descriptions=True)
+        VOLUME_OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        VOLUME_OUT_PATH.write_text(generate_html(leads, volume_channels, run_date, weekly_insight, "volume"), encoding="utf-8")
+        generated.append(VOLUME_OUT_PATH)
+    print(f"[Report] Generated {', '.join(map(str, generated))} ({len(leads)} leads, {len(public_channels)} channels)")
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--page", choices=("all", "main", "channels", "volume"), default="all")
+    run(parser.parse_args().page)

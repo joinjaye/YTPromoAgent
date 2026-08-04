@@ -43,9 +43,9 @@ SEARCH_KEYWORDS = [
 # 不如只对真正要做时间窗口分析的核心竞品放宽上限，其余关键词维持原来的 1 页
 # （50 条/天）——这样不需要精简 SEARCH_KEYWORDS 也能保证核心竞品数据基本完整，
 # 配额压力也可控：
-#   核心竞品：len(CORE_COMPETITOR_KEYWORDS) × 最多 10 页 × 100 单位 ≈ 7,000 单位
-#   其余关键词：(101 - 7) × 1 页 × 100 单位 ≈ 9,400 单位
-#   两者合计的理论上限 ≈ 16,400 单位/天，在 YOUTUBE_API_KEYS 配了 3 个 key 轮换
+#   核心竞品：len(CORE_COMPETITOR_KEYWORDS) × 最多 10 页 × 100 单位 ≈ 5,000 单位
+#   其余关键词：(100 - 5) × 1 页 × 100 单位 ≈ 9,500 单位
+#   两者合计的理论上限 ≈ 14,500 单位/天，在 YOUTUBE_API_KEYS 配了 3 个 key 轮换
 #   （理论总预算 30,000 单位/天）的前提下留有余量；这是"全部核心词都刚好在
 #   当天用满 10 页"的最坏情况，正常情况下远用不到（翻页循环会在结果拿完后
 #   自然停止，见 _search_video_ids 里的 break 条件）。
@@ -54,7 +54,62 @@ SEARCH_KEYWORDS = [
 # ——不是巧合，是故意的：时间窗口对比只有在数据基本完整时才有意义，非核心关键词
 # 仍然只有 1 页/天，拿去做周度声量对比会跟"数据被截断"的问题一样，所以看板直接
 # 不展示那些词，避免出现看似可信、实际不完整的对比图表。
-CORE_COMPETITOR_KEYWORDS = {"weex", "bitunix", "blofin", "bingx", "zoomex", "lbank", "phemex"}
+CORE_COMPETITOR_KEYWORDS = {"weex", "bitunix", "blofin", "bingx", "zoomex"}
+CORE_COMPETITOR_DISPLAY_NAMES = {
+    "weex": "Weex", "bitunix": "Bitunix", "blofin": "Blofin",
+    "bingx": "BingX", "zoomex": "Zoomex",
+}
+
+# Only explicitly maintained channel IDs are treated as official.  An empty
+# set deliberately means "unknown" rather than guessing from channel names.
+OFFICIAL_COMPETITOR_CHANNEL_IDS: dict[str, set[str]] = {
+    "Weex": set(),
+    "Bitunix": set(),
+    "Blofin": set(),
+    "BingX": set(),
+    "Zoomex": set(),
+}
+
+# Explainable, multi-label topic rules.  Keep these here (rather than in the
+# report template) so crawl-time enrichment, reports and tests share one source
+# of truth.  Matching is case-insensitive against title + description + hashtags.
+CONTENT_TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "Activity": (
+        "campaign", "competition", "contest", "giveaway", "bonus", "reward",
+        "airdrop", "event", "活动", "大赛", "赠金", "奖励", "抽奖",
+    ),
+    "Product": (
+        "product", "feature", "app", "platform", "copy trading", "futures",
+        "spot trading", "wallet", "产品", "功能", "合约", "现货", "跟单",
+    ),
+    "Tutorial": (
+        "how to", "tutorial", "guide", "step by step", "setup", "deposit",
+        "withdraw", "register", "教程", "指南", "如何", "注册", "充值", "提现",
+    ),
+    "Market Analysis": (
+        "market analysis", "price analysis", "technical analysis", "forecast",
+        "outlook", "行情", "市场分析", "技术分析", "走势", "预测",
+    ),
+    "Trading Signal": (
+        "trading signal", "trade signal", "entry", "take profit", "stop loss",
+        "long signal", "short signal", "交易信号", "入场", "止盈", "止损",
+    ),
+    "Review/Comparison": (
+        "review", "comparison", "compare", " vs ", "versus", "pros and cons",
+        "评测", "测评", "对比", "比较", "优缺点",
+    ),
+    "Listing": (
+        "listing", "listed", "new pair", "launchpool", "上币", "上线", "新币",
+    ),
+    "Brand Introduction": (
+        "what is", "introduction", "overview", "explained", "介绍", "是什么", "品牌",
+    ),
+}
+
+# Small samples should not receive percentile or structural certainty labels.
+EARLY_PERFORMANCE_MIN_SAMPLE = 5
+WOW_HIGHLIGHT_PERCENT = 30
+WOW_HIGHLIGHT_ABS_CHANGE = 3
 
 SEARCH_MAX_RESULTS = 50            # 默认（非核心关键词）翻页上限：1 页
 CORE_SEARCH_MAX_RESULTS = 500      # 核心竞品关键词翻页上限：10 页
