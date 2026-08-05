@@ -594,6 +594,7 @@ body.guide-opened {{ overflow:hidden; }}
 .table-external-link:hover {{ color:var(--cyan); background:rgba(255,0,51,.15); }}
 .table-external-link:active {{ background:rgba(255,0,51,.22); }}
 .table-external-link:focus-visible {{ outline:2px solid var(--cyan); outline-offset:2px; }}
+.table-external-link:disabled {{ opacity:0.35; cursor:not-allowed; }}
 .table-toolbar {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; gap:12px; flex-wrap:wrap; }}
 .table-toolbar input {{
   background:var(--surface); border:1px solid var(--border); border-radius:6px;
@@ -676,6 +677,7 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
 .filter-search-wide {{ grid-column:span 2; }}
 .filter-reset {{ min-height:44px; padding:8px 14px; border-radius:7px; border:1px solid var(--border); color:#CBD5E1; background:var(--surface); cursor:pointer; }}
 .filter-reset:hover {{ border-color:var(--border-h); color:var(--cyan); }}
+.filter-reset:disabled {{ opacity:0.35; cursor:not-allowed; }}
 .filter-platform-row {{ display:flex; align-items:flex-start; gap:14px; margin-top:14px; }}
 .filter-platform-row > span {{ padding-top:12px; color:#94A3B8; font:11px var(--font-mono); }}
 .filter-platform-row .chip-row {{ margin-bottom:0; }}
@@ -1001,7 +1003,13 @@ td a:hover {{ color:var(--cyan); text-decoration:underline; }}
     <div class="table-card">
       <div class="table-card-header">
         <h3>频道明细（按频道去重合并，含未识别推广平台的频道）</h3>
-        {channels_lark_link_html}
+        <div style="display:flex;align-items:center;gap:10px">
+          <button type="button" class="table-external-link" id="chExportDetailBtn" disabled title="下载当前筛选条件下呈现的全部频道数据">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg>
+            <span>下载详情 CSV</span>
+          </button>
+          {channels_lark_link_html}
+        </div>
       </div>
       <div class="hint">点击一行展开，查看该频道逐条抓到的视频（发布时间 / 观看数）</div>
       <div class="table-toolbar">
@@ -1380,12 +1388,45 @@ function countryFlag(code) {{
   return String.fromCodePoint(...[...code.toUpperCase()].map(c => base + c.charCodeAt(0) - 65));
 }}
 
+// CSV 字段转义：值含引号/逗号/换行时加引号并转义内部引号。放在页面共享的
+// 预处理区（channels/main/volume 三个页面裁剪脚本时都保留这段代码之前的内容），
+// 这样各页各自的 CSV 导出函数都能直接调用，不必各自重复实现。
+function csvFieldV2(value) {{
+  const str = value === null || value === undefined ? '' : String(value);
+  return /["\\n,]/.test(str) ? `"${{str.replace(/"/g, '""')}}"` : str;
+}}
+
 function videoDetailCell(v) {{
   return `<div class="detail-item">
     <span class="yt-detail-meta">${{v.published_at ? v.published_at.slice(0, 10) : ''}}</span>
     <span class="yt-detail-meta">${{(v.view_count || 0).toLocaleString()}} 次观看</span>
     ${{linkCell(v.video_url)}}${{v.video_title ? ` — ${{truncate(v.video_title, 60)}}` : ''}}
   </div>`;
+}}
+
+// 导出当前筛选条件下呈现的全部频道（不要求先展开行；channels 传入的是
+// 过滤后的完整列表，与筛选条件、搜索框实时同步）。字段与频道表格列一一对应：
+// 频道 / 市场 / 粉丝数 / 频道规模 / 推广平台 / 联系方式 / 本次抓取 / 活跃时间。
+function exportChannelsDetailCsv(channels) {{
+  if (!channels || !channels.length) return;
+  const headers = ['频道名称','频道链接','国家','语言','市场','粉丝数','频道规模-累计播放','频道规模-累计视频数','推广平台','联系方式','本次抓取-观看数','本次抓取-视频数','活跃时间','最近抓取日期','首次抓取日期'];
+  const lines = [headers.map(csvFieldV2).join(',')];
+  channels.forEach(r => {{
+    lines.push([
+      r.account_name, r.profile_url, r.country, r.language, r.market, r.followers,
+      r.channel_view_cnt, r.channel_video_cnt, r.promo_platform, r.contact,
+      r.total_views, (r.videos || []).length, r.latest_promo_date, r.last_crawled_date, r.first_seen_date
+    ].map(csvFieldV2).join(','));
+  }});
+  const blob = new Blob(['﻿' + lines.join('\\r\\n')], {{type:'text/csv;charset=utf-8;'}});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `channels-detail-${{new Date().toISOString().slice(0,10)}}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }}
 
 function createChannelTableController(cfg) {{
@@ -1430,6 +1471,7 @@ function createChannelTableController(cfg) {{
     page = Math.min(page, totalPages);
     const start = (page - 1) * cfg.pageSize;
     const rows = filtered.slice(start, start + cfg.pageSize);
+    if (els.exportBtn) document.getElementById(els.exportBtn).disabled = filtered.length === 0;
 
     if (rows.length === 0) {{
       tbody.innerHTML = '';
@@ -1520,6 +1562,7 @@ function createChannelTableController(cfg) {{
 
   return {{
     setData(newData) {{ cfg.data = newData; applyFilter(); }},
+    getFilteredChannels() {{ return filtered; }},
     expandChannel(channelId) {{
       expanded.add(channelId);
       const idx = filtered.findIndex(r => r.channel_id === channelId);
@@ -1536,8 +1579,9 @@ const channelsTable = createChannelTableController({{
   pageSize: 20,
   sortKeyDefault: 'latest_promo_date',
   sortDirDefault: 'desc',
-  elIds: {{ tbody: 'tbody-channels', meta: 'meta-channels', pageInfo: 'pageInfo-channels', prevBtn: 'prev-channels', nextBtn: 'next-channels', empty: 'empty-channels', theadRow: 'thead-channels' }},
+  elIds: {{ tbody: 'tbody-channels', meta: 'meta-channels', pageInfo: 'pageInfo-channels', prevBtn: 'prev-channels', nextBtn: 'next-channels', empty: 'empty-channels', theadRow: 'thead-channels', exportBtn: 'chExportDetailBtn' }},
 }});
+document.getElementById('chExportDetailBtn').addEventListener('click', () => exportChannelsDetailCsv(channelsTable.getFilteredChannels()));
 
 // ── Channels tab: all filters drive KPIs, both charts, and the detail table. ──
 const followerBands = {{
@@ -2277,6 +2321,7 @@ volGuideSearch?.addEventListener('input',()=>{{
 const volSelectedV2 = new Set(CORE_COMPETITOR_PLATFORMS);
 let volChartsV2 = {{}};
 let volDrillStateV2 = null;
+let volDrillRowsV2 = [];
 const fmtNumV2 = value => value === null || value === undefined ? '—' : Number(value).toLocaleString();
 const fmtPctV2 = value => value === null || value === undefined ? '—' : `${{(Number(value) * 100).toFixed(1)}}%`;
 const escV2 = value => String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
@@ -2450,9 +2495,36 @@ function evidenceDetailsV2(row) {{
 
 function closeVolDrillV2() {{
   volDrillStateV2 = null;
+  volDrillRowsV2 = [];
   const panel = document.getElementById('volDrillPanel');
   panel.style.display = 'none';
   panel.innerHTML = '';
+}}
+
+function exportVolDrillCsv() {{
+  const rows = volDrillRowsV2;
+  if (!rows || !rows.length) return;
+  const headers = ['日期','账号','市场','语言','推广方式','内容主题','首采播放','首采点赞','首采评论','首采互动率','观察时长分桶','观察时长(小时)','补采播放','补采点赞','补采评论','补采时间','视频标题','视频链接','推广平台数'];
+  const lines = [headers.map(csvFieldV2).join(',')];
+  rows.forEach(row => {{
+    lines.push([
+      row.date, row.account, row.market, row.language,
+      (row.promotion_methods || []).join('；'), (row.content_topics || []).join('；'),
+      row.view_count, row.like_count, row.comment_count, fmtPctV2(row.initial_engagement_rate),
+      row.observation_bucket, row.observation_age_hours, row.backfill_view_count, row.backfill_like_count,
+      row.backfill_comment_count, row.backfill_captured_at, row.title, row.video_url, row.promoted_platform_count
+    ].map(csvFieldV2).join(','));
+  }});
+  const blob = new Blob(['﻿' + lines.join('\\r\\n')], {{type:'text/csv;charset=utf-8;'}});
+  const url = URL.createObjectURL(blob);
+  const state = volDrillStateV2 || {{}};
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `volume-detail-${{state.platform || 'all'}}-${{state.start || ''}}-${{state.end || ''}}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }}
 
 function openVolDrillV2(platform, summary, options={{}}) {{
@@ -2464,8 +2536,9 @@ function openVolDrillV2(platform, summary, options={{}}) {{
     .sort((a,b) => (b.view_count ?? -1) - (a.view_count ?? -1));
   const titleCovered = rows.filter(row => row.title).length;
   volDrillStateV2 = {{platform,start,end,source}};
+  volDrillRowsV2 = rows;
   const panel = document.getElementById('volDrillPanel');
-  panel.innerHTML = `<div class="section-head"><h3>${{escV2(platform)}} · 视频明细</h3><span class="hint-inline">${{start}} — ${{end}} · ${{rows.length}} 个去重推广视频 · 标题覆盖 ${{titleCovered}}/${{rows.length}}</span></div>
+  panel.innerHTML = `<div class="section-head"><h3>${{escV2(platform)}} · 视频明细</h3><span style="display:flex;align-items:center;gap:14px"><span class="hint-inline">${{start}} — ${{end}} · ${{rows.length}} 个去重推广视频 · 标题覆盖 ${{titleCovered}}/${{rows.length}}</span><button type="button" class="filter-reset" onclick="exportVolDrillCsv()"${{rows.length ? '' : ' disabled'}}>下载 CSV</button></span></div>
     <div class="table-wrap"><table class="detail-table"><thead><tr><th>账号 / 市场</th><th>推广方式 / 主题</th><th>首采表现</th><th>观察时长</th><th>视频标题</th><th>推广平台</th></tr></thead><tbody>${{rows.map(row => {{
       const rate = row.initial_engagement_rate;
       const high = early.has(`${{row.platform}}||${{row.video_url}}`) ? '<span class="signal-pill">早期高表现</span>' : '';
