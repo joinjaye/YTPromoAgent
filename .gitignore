@@ -1,4 +1,5 @@
 .env
+.weekly_insight_context.json
 __pycache__/
 *.pyc
 *.pyo
