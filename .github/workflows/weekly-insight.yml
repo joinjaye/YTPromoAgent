@@ -1,9 +1,9 @@
 name: Weekly AI Winsight
 
 on:
-  schedule:
-    # Every Friday 09:00 Asia/Shanghai (GitHub cron uses UTC).
-    - cron: '0 1 * * 5'
+  # Triggered by an external cron-job.org job hitting the workflow_dispatch
+  # API on Fridays — GitHub's own `schedule:` trigger was unreliable (runs
+  # delayed by hours or dropped), same reason PromoLeads Crawl uses it too.
   workflow_dispatch:
 
 permissions:
@@ -34,9 +34,10 @@ jobs:
       - name: Install Cursor Agent CLI
         run: curl https://cursor.com/install -fsS | bash
 
+      - name: Create .env
+        run: echo "${{ secrets.ENV_FILE }}" > .env
+
       - name: Generate weekly Winsight
-        env:
-          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           python3 weekly_insight.py

@@ -16,11 +16,14 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from reporter import CORE_COMPETITOR_PLATFORMS, load_channels, load_leads
 from competitor_analysis import build_video_facts, latest_complete_week, summarize_window
 
 
 ROOT = Path(__file__).parent
+load_dotenv(ROOT / ".env")
 INSTRUCTION_PATH = ROOT / "insight_instruction.md"
 OUTPUT_PATH = ROOT / "data" / "weekly_insight.json"
 CST = timezone(timedelta(hours=8))
